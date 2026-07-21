@@ -235,7 +235,7 @@ body {
 }
 .tab-close:hover { background: var(--error); color: white; }
 
-/* tab 状态徽章（agent / 长命令） */
+/* tab 状态徽章（运行中 / 后台完成） */
 .tab-badge {
   width: 8px;
   height: 8px;
@@ -262,6 +262,7 @@ body {
   70% { box-shadow: 0 0 0 6px rgba(232, 141, 167, 0); }
   100% { box-shadow: 0 0 0 0 rgba(232, 141, 167, 0); }
 }
+/* 仅当前命令是 Agent 时强调标题 */
 .tab.has-agent .tab-title {
   color: var(--accent);
 }

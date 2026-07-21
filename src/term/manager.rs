@@ -44,8 +44,6 @@ struct Tab {
     project_id: u32,
     /// 最近已知的工作目录（shell integration / 创建时）
     cwd: String,
-    /// 启动时附带的命令（agent 等），用于会话恢复重跑
-    command: Option<String>,
 }
 
 /// 对外暴露的 tab 快照（会话持久化用）
@@ -55,7 +53,6 @@ pub struct TabInfo {
     pub project_id: u32,
     pub title: String,
     pub cwd: String,
-    pub command: Option<String>,
 }
 
 /// 终端 Manager：管理所有 tab
@@ -174,7 +171,6 @@ impl TermManager {
                 title,
                 project_id,
                 cwd: cwd_owned,
-                command: None,
             },
         );
         self.tab_order.push(tab_id);
@@ -226,13 +222,6 @@ impl TermManager {
         }
     }
 
-    /// 记录 tab 的启动命令（agent 恢复用）
-    pub fn set_command(&mut self, tab_id: u32, command: Option<String>) {
-        if let Some(tab) = self.tabs.get_mut(&tab_id) {
-            tab.command = command.filter(|c| !c.trim().is_empty());
-        }
-    }
-
     /// 设置默认 cwd（切换项目时调用）
     pub fn set_default_cwd(&mut self, cwd: String) {
         self.default_cwd = cwd;
@@ -253,7 +242,6 @@ impl TermManager {
                     project_id: t.project_id,
                     title: t.title.clone(),
                     cwd: t.cwd.clone(),
-                    command: t.command.clone(),
                 })
             })
             .collect()

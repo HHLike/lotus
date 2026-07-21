@@ -455,7 +455,7 @@ pub struct TabSession {
     pub project_id: u32,
     pub title: String,
     pub cwd: String,
-    /// 若该 tab 是用 LaunchAgent 等方式带命令启动的，重启后可重跑
+    /// 旧版 sessions.json 兼容字段；恢复前会丢弃，不会重跑
     #[serde(default)]
     pub command: Option<String>,
 }
@@ -543,6 +543,13 @@ impl SessionStore {
         });
     }
 
+    /// Remove executable commands while retaining Tab metadata.
+    pub fn discard_commands(&mut self) {
+        for tab in &mut self.tabs {
+            tab.command = None;
+        }
+    }
+
     /// 用当前运行时 tab 快照整体替换并保存
     pub fn replace_from(
         &mut self,
@@ -551,6 +558,7 @@ impl SessionStore {
         runtime_tabs: &[(u32, u32)],        // (tab_id, project_id) 有序
     ) {
         self.tabs = tabs;
+        self.discard_commands();
         self.active_by_project.clear();
 
         // 建立 project -> 该项目 runtime tab_id 有序列表
@@ -566,5 +574,54 @@ impl SessionStore {
             }
         }
         self.sanitize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SessionStore, TabSession};
+    use std::collections::HashMap;
+
+    #[test]
+    fn legacy_session_command_is_read_then_discarded_before_restore() {
+        let json = r#"{
+            "tabs": [{
+                "project_id": 1,
+                "title": "pi",
+                "cwd": "/tmp/project",
+                "command": "pi"
+            }],
+            "active_by_project": {"1": 0}
+        }"#;
+
+        let mut store: SessionStore = serde_json::from_str(json).unwrap();
+        assert_eq!(store.tabs[0].command.as_deref(), Some("pi"));
+
+        store.discard_commands();
+
+        assert_eq!(store.tabs[0].command, None);
+        assert_eq!(store.tabs[0].title, "pi");
+        assert_eq!(store.tabs[0].cwd, "/tmp/project");
+    }
+
+    #[test]
+    fn replacing_session_snapshot_never_keeps_replayable_commands() {
+        let mut store = SessionStore::default();
+        let mut active = HashMap::new();
+        active.insert(1, 7);
+
+        store.replace_from(
+            vec![TabSession {
+                project_id: 1,
+                title: "pi".into(),
+                cwd: "/tmp/project".into(),
+                command: Some("pi".into()),
+            }],
+            &active,
+            &[(7, 1)],
+        );
+
+        assert_eq!(store.tabs[0].command, None);
+        assert_eq!(store.active_by_project.get(&1), Some(&0));
     }
 }
