@@ -51,7 +51,7 @@ Lotus 是独立的 **GUI 终端应用**（不是 TUI）。设计语言参考 [Ot
 ### Agent 友好
 - **Agents 面板**：探测本机 `claude` / `codex` / `opencode` / `pi` / `aider` 等，一键新标签启动
 - **Tab 徽章**：运行中 / 成功 / 失败状态
-- **完成通知**：长任务或 Agent 结束时桌面通知（`notify-send`）
+- **完成通知**：仅后台运行至少 10 秒的任务结束时发送桌面通知（`notify-send`）
 - 不抢占 Agent 自带输入框（Pi / Claude 等 TUI 全屏使用）
 
 ### 交互

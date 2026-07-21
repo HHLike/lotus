@@ -799,12 +799,6 @@ function handleServerMessage(msg) {
       const t = terminals.get(msg.tab_id);
       if (t) t.title = msg.title;
       updateTabTitle(msg.tab_id, msg.title);
-      if (isAgentCommand(msg.title)) {
-        const rt = ensureTabRuntime(msg.tab_id);
-        rt.isAgent = true;
-        const tabEl = document.querySelector(`.tab[data-tab-id="${msg.tab_id}"]`);
-        if (tabEl) tabEl.classList.add('has-agent');
-      }
       break;
     }
     case 'theme': {
@@ -999,9 +993,8 @@ function addTabUI(tabId, title, projectId) {
   `;
   // 初始化 tab 运行时状态
   if (!tabRuntime.has(tabId)) {
-    tabRuntime.set(tabId, { busy: false, cmd: '', isAgent: isAgentCommand(title) });
+    tabRuntime.set(tabId, AgentPolicy.createRuntime());
   }
-  if (isAgentCommand(title)) tab.classList.add('has-agent');
   // 点击 tab 切换
   tab.addEventListener('click', (e) => {
     if (e.target.classList.contains('tab-close')) {
@@ -2330,7 +2323,7 @@ if (document.readyState === 'loading') {
 
 function ensureTabRuntime(tabId) {
   if (!tabRuntime.has(tabId)) {
-    tabRuntime.set(tabId, { busy: false, cmd: '', isAgent: false });
+    tabRuntime.set(tabId, AgentPolicy.createRuntime());
   }
   return tabRuntime.get(tabId);
 }
@@ -2355,14 +2348,17 @@ function clearTabDoneBadge(tabId) {
 }
 
 function onCommandStarted(tabId, cmd) {
-  const rt = ensureTabRuntime(tabId);
-  rt.busy = true;
-  rt.cmd = cmd || '';
-  if (isAgentCommand(cmd)) {
-    rt.isAgent = true;
-    const tabEl = document.querySelector(`.tab[data-tab-id="${tabId}"]`);
-    if (tabEl) tabEl.classList.add('has-agent');
-    // 用 agent 名更新 tab 标题
+  const rt = AgentPolicy.startCommand(
+    ensureTabRuntime(tabId),
+    cmd,
+    isAgentCommand(cmd)
+  );
+  tabRuntime.set(tabId, rt);
+
+  const tabEl = document.querySelector(`.tab[data-tab-id="${tabId}"]`);
+  if (tabEl) tabEl.classList.toggle('has-agent', rt.isAgent);
+
+  if (rt.isAgent) {
     const short = String(cmd).trim().split(/\s+/)[0];
     updateTabTitle(tabId, short);
   }
@@ -2370,31 +2366,33 @@ function onCommandStarted(tabId, cmd) {
 }
 
 function onCommandFinished(tabId, cmd, code, durationMs) {
-  const rt = ensureTabRuntime(tabId);
-  rt.busy = false;
-  rt.cmd = '';
+  if (!tabRuntime.has(tabId)) return;
+
+  const previous = tabRuntime.get(tabId);
+  const key = AgentPolicy.completionKey(cmd, code, durationMs);
+  const finished = AgentPolicy.finishCommand(previous, key);
+  if (finished.duplicate) return;
+  tabRuntime.set(tabId, finished.runtime);
+
+  const tabEl = document.querySelector(`.tab[data-tab-id="${tabId}"]`);
+  if (tabEl) tabEl.classList.remove('has-agent');
+
   const ok = code === 0;
-  setTabBadge(
-    tabId,
-    ok ? 'done' : 'error',
-    (ok ? '已完成' : '失败') + ': ' + (cmd || '') + (durationMs ? ` (${Math.round(durationMs / 100) / 10}s)` : '')
-  );
+  const active = getActiveTabId() === tabId;
+  const disposition = AgentPolicy.completionDisposition({ active, durationMs, ok });
+  const badgeTitle =
+    (ok ? '已完成' : '失败') + ': ' + (cmd || '') +
+    (durationMs ? ` (${Math.round(durationMs / 100) / 10}s)` : '');
+  setTabBadge(tabId, disposition.badge, disposition.badge ? badgeTitle : '');
 
-  // 当前聚焦 tab 几秒后自动清徽章
-  if (getActiveTabId() === tabId) {
-    setTimeout(() => clearTabDoneBadge(tabId), 2500);
-  }
-
-  // agent 任务，或后台较长命令 → 桌面通知
-  const isAgent = rt.isAgent || isAgentCommand(cmd);
-  const notFocused = getActiveTabId() !== tabId;
-  if (isAgent || (notFocused && durationMs >= 5000)) {
+  if (disposition.notify) {
+    const isAgent = finished.wasAgent || isAgentCommand(cmd);
     const status = ok ? '完成' : '失败';
     const short = String(cmd || '').replace(/\n/g, ' ').slice(0, 60);
     sendToBackend({
       type: 'desktop_notify',
       title: isAgent ? `Agent ${status}` : `命令${status}`,
-      body: short + (durationMs ? ` · ${(durationMs / 1000).toFixed(1)}s` : ''),
+      body: short + ` · ${(durationMs / 1000).toFixed(1)}s`,
     });
   }
 }
