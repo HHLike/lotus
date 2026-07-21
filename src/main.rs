@@ -674,14 +674,8 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
             });
             if !s.first_tab_created {
                 s.first_tab_created = true;
-                // 恢复上次会话的全部 tab；若无会话则开 1 个默认 tab
-                let delayed = restore_sessions(&mut s);
-                // 延迟写入恢复的 agent 命令（需等 shell 初始化）
-                if !delayed.is_empty() {
-                    drop(s);
-                    schedule_tab_commands(state, delayed);
-                    return;
-                }
+                // Restore Tab metadata only. Commands are never replayed.
+                restore_sessions(&mut s);
             }
         }
         ClientMessage::Input { tab_id, data } => match ipc::decode_b64(&data) {
@@ -1049,7 +1043,6 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
                     Ok(tab_id) => {
                         info!("启动 agent tab {} → {}", tab_id, command);
                         m.set_title(tab_id, tab_title.clone());
-                        m.set_command(tab_id, Some(command.clone()));
                         s.active_tab_by_project.insert(pid, tab_id);
                         s.pending_outputs.push(ServerMessage::TabCreated {
                             tab_id,
@@ -1209,7 +1202,7 @@ fn persist_sessions(s: &AppState) {
             project_id: t.project_id,
             title: t.title,
             cwd: t.cwd,
-            command: t.command,
+            command: None,
         })
         .collect();
     let mut store = SessionStore::default();
@@ -1220,9 +1213,9 @@ fn persist_sessions(s: &AppState) {
 }
 
 /// 启动时从 sessions.json 恢复各项目 tab。
-/// 返回需要延迟写入 PTY 的 (tab_id, command, title) 列表（agent 重跑）。
-fn restore_sessions(s: &mut AppState) -> Vec<(u32, String, String)> {
-    let store = SessionStore::load();
+fn restore_sessions(s: &mut AppState) {
+    let mut store = SessionStore::load();
+    store.discard_commands();
     let active_by_project = store.active_by_project.clone();
     // 只恢复仍然存在的项目
     let mut pending: Vec<TabSession> = store
@@ -1253,7 +1246,6 @@ fn restore_sessions(s: &mut AppState) -> Vec<(u32, String, String)> {
 
     // 计算每个项目的 active 下标
     let mut idx_in_proj: HashMap<u32, usize> = HashMap::new();
-    let mut delayed: Vec<(u32, String, String)> = Vec::new();
 
     info!("恢复 tab 会话：共 {} 个", pending.len());
 
@@ -1278,9 +1270,6 @@ fn restore_sessions(s: &mut AppState) -> Vec<(u32, String, String)> {
             match m.create_tab(80, 24, Some(&cwd), pid) {
                 Ok(tab_id) => {
                     m.set_title(tab_id, title.clone());
-                    if let Some(cmd) = sess.command.clone() {
-                        m.set_command(tab_id, Some(cmd));
-                    }
                     Some(tab_id)
                 }
                 Err(e) => {
@@ -1302,11 +1291,6 @@ fn restore_sessions(s: &mut AppState) -> Vec<(u32, String, String)> {
                 project_id: pid,
                 activate,
             });
-            if let Some(cmd) = sess.command {
-                if !cmd.trim().is_empty() {
-                    delayed.push((tab_id, cmd, title));
-                }
-            }
         }
     }
 
@@ -1337,7 +1321,6 @@ fn restore_sessions(s: &mut AppState) -> Vec<(u32, String, String)> {
     }
 
     persist_sessions(s);
-    delayed
 }
 
 /// 延迟把命令写入新 tab 的 PTY（等 shell 初始化）
