@@ -88,6 +88,445 @@ function sendToBackend(msg) {
   window.ipc.postMessage(json);
 }
 
+// ====== IME 诊断日志（开发期排查用，仅输出到 console，不在屏幕显示）======
+// 历史：曾有一个屏幕可见的绿色诊断面板（IME_DIAG_PANEL=true），用于定位
+// fcitx5 + WebKitGTK 下的中文输入重复问题。问题已通过 monkey-patch xterm 的
+// _finalizeComposition 解决，面板已移除，仅保留 console.log 便于未来排查。
+function imeDiag(tag, data, extra) {
+  console.log('[lotus][IME]', tag, JSON.stringify(data), extra ? JSON.stringify(extra) : '');
+}
+
+// ====== IME 去重（WebKitGTK + fcitx5 + xterm.js）======
+// 已知根因（参考 vmark issue #948）：
+// WebKitGTK 在 Linux + fcitx5 下，对中文提交的处理与标准不同：
+//   · compositionstart 经常不发，compositionend 仍发，但 ev.isComposing 可能是 false
+//   · 提交文本通过 onData 多次到达：可能是完全相同、后缀片段、或拼接的整数倍
+// 因此本模块【不依赖 compositionstart】，把 compositionend / beforeinput / input
+// 都视作「提交锚点」，然后在 onData 里用「第一次匹配放行 + 后续所有匹配丢弃」去重。
+//
+// 去重匹配覆盖以下重复形态（设提交文本 T = "现在？"）：
+//   1) 完全相同：data == "现在？"
+//   2) 半/全角标点对应：data == "现在?"（？ vs ?）
+//   3) 后缀片段：data == "在？" 或 "？"（data 是 T 的尾部）
+//   4) 整数倍拼接：data == "现在？现在？"（T 重复 N 次）
+//   5) 拼接 + 后缀：data == "现在？在？"（T + 后缀）
+const IME_PUNCT_PAIRS = [
+  [',', '，'], ['.', '。'], ['?', '？'], ['!', '！'],
+  [':', '：'], [';', '；'], ['\\', '、'], ['^', '……'],
+  ['(', '（'], [')', '）'], ['[', '【'], [']', '】'],
+  ['<', '《'], ['>', '》'], ['"', '“'], ['"', '”'],
+  ["'", '‘'], ["'", '’'], ['~', '～'], ['$', '￥'],
+];
+
+function imeTextEquivalent(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  for (const [hw, fw] of IME_PUNCT_PAIRS) {
+    if ((a === hw && b === fw) || (a === fw && b === hw)) return true;
+  }
+  return false;
+}
+
+// 字符级等价（含半全角）
+function imeCharEq(ac, bc) {
+  if (ac === bc) return true;
+  for (const [hw, fw] of IME_PUNCT_PAIRS) {
+    if ((ac === hw && bc === fw) || (ac === fw && bc === hw)) return true;
+  }
+  return false;
+}
+
+// 字符串等价（逐字符，含半全角）
+function imeStrEq(a, b) {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (!imeCharEq(a[i], b[i])) return false;
+  }
+  return true;
+}
+
+// 判断 data 是否是 commitText 的「末尾后缀」（含半全角）。
+// data="在？", commitText="现在？" → true
+function imeIsSuffixDup(data, commitText) {
+  if (!data || !commitText) return false;
+  if (data.length > commitText.length) return false;
+  const off = commitText.length - data.length;
+  for (let i = 0; i < data.length; i++) {
+    if (!imeCharEq(data[i], commitText[off + i])) return false;
+  }
+  return true;
+}
+
+// 判断 data 是否是「lastSent 的后缀 + commit 的拼接」（含半全角）。
+// 这是 xterm.js DOM 渲染器在 fcitx5 逐字提交时的真实重复模式：
+//   用户输入「没有，」时：
+//     compositionend "没有"  → onData "没有" → 发送（lastSent="没有"）
+//     compositionend ","    → onData ","   → 发送（lastSent=","，commit=","）
+//     ❌ xterm 又发 onData "有,"（"没有"的末尾字"有" + commit","）
+// 所以 data = "有," 可以拆成：前缀"有"是某次已发送文本"没有"的后缀 + 后半","等于 commit
+// 检测到这种拼接就丢弃。
+// 注意：要找 lastSentPool 里任意一次已发送文本的后缀，而不只是最近一次。
+function imeIsSentSuffixPlusCommit(data, lastSentPool, commitText) {
+  if (!data || !commitText || lastSentPool.length === 0) return false;
+  const cLen = commitText.length;
+  if (data.length <= cLen) return false;  // data 必须比 commit 长（前面有"已发送后缀"）
+  // data 的后半部分（最后 cLen 个字符）必须等价于 commit
+  const tail = data.slice(data.length - cLen);
+  if (!imeStrEq(tail, commitText)) return false;
+  // data 的前半部分（前 data.length - cLen 个字符）必须是某个已发送文本的后缀
+  const head = data.slice(0, data.length - cLen);
+  if (head.length === 0) return false;
+  for (const sent of lastSentPool) {
+    if (!sent || sent.length < head.length) continue;
+    // 检查 head 是否是 sent 的后缀
+    const off = sent.length - head.length;
+    let ok = true;
+    for (let i = 0; i < head.length; i++) {
+      if (!imeCharEq(head[i], sent[off + i])) { ok = false; break; }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
+// 判断 data 是否是 commitText 的「拼接重复」（data 比 commitText 长，含半全角）。
+// 覆盖形态（设 T = "现在？"）：
+//   · T×N (N>=2):          "现在？现在？"
+//   · T + T的循环前缀:     "现在？现"
+//   · T + T的尾部片段:     "现在？在？"（T 后面接 T 自身的后缀，fcitx5 常见重复模式）
+//   · T×N + 尾部片段:      "现在？现在？在？"
+// 算法：data 必须以 T 开头；然后剩余部分（data[|T|..]）必须是 T 的某个后缀。
+// 这统一覆盖了「T 重复 + 末尾补尾」的所有情况。
+function imeIsMultipleDup(data, commitText) {
+  if (!data || !commitText || commitText.length === 0) return false;
+  if (data.length <= commitText.length) return false;  // 等于/短于 T 由 seen / suffix 处理
+  // 必须以 T 开头
+  for (let j = 0; j < commitText.length; j++) {
+    if (!imeCharEq(data[j], commitText[j])) return false;
+  }
+  // 剩余部分必须是 T 的「循环重复 + 尾部片段」
+  // 即把 T 无限重复填满剩余长度，但允许在某个 T 边界后接 T 的任意后缀。
+  // 简化：剩余部分（tail）只要满足「tail 是 (T 重复 N 次) + (T 的后缀)」即可。
+  // 这等价于：tail 中每个字符要么匹配 T 的循环，要么匹配 T 的某个连续后缀。
+  // 更直接的判断：data 必须匹配 ^(T)+ (T的后缀)?$ 的某种形态。
+  // 用最朴素的枚举：尝试所有可能的「完整 T 的个数 + 剩余后缀长度」。
+  const tail = data.slice(commitText.length);  // 剩余待匹配部分
+  const Tlen = commitText.length;
+  // 尝试 tail 由若干个完整 T + 一个 T 的后缀（长度 0..Tlen-1）构成
+  // 即检查：对于某个 k >= 0，tail[0..k*Tlen] 全部匹配 T 的循环，
+  // 且剩余 tail[k*Tlen..] 是 T 的后缀（连续）。
+  for (let fullCount = 0; fullCount * Tlen <= tail.length + Tlen; fullCount++) {
+    const prefixEnd = fullCount * Tlen;
+    if (prefixEnd > tail.length) break;
+    // 检查 tail[0..prefixEnd] 是否匹配 T 循环
+    let okPrefix = true;
+    for (let k = 0; k < prefixEnd; k++) {
+      if (!imeCharEq(tail[k], commitText[k % Tlen])) { okPrefix = false; break; }
+    }
+    if (!okPrefix) continue;
+    // 剩余部分 tail[prefixEnd..] 必须是 T 的后缀（连续）
+    const restLen = tail.length - prefixEnd;
+    if (restLen === 0) return true;  // 完整 T×(fullCount+1)
+    if (restLen >= Tlen) continue;   // 剩余太长，不是后缀
+    // 检查 tail[prefixEnd..] 是否等于 commitText[Tlen-restLen .. Tlen-1]
+    let okRest = true;
+    for (let k = 0; k < restLen; k++) {
+      if (!imeCharEq(tail[prefixEnd + k], commitText[Tlen - restLen + k])) { okRest = false; break; }
+    }
+    if (okRest) return true;
+  }
+  return false;
+}
+
+function createImeInputGuard() {
+  return {
+    // 【不依赖】composing —— WebKitGTK 可能不发 compositionstart，只作辅助
+    composing: false,
+    // { text, until, seen }
+    // commit.text = 最近一次提交文本（来自 compositionend / beforeinput / input）
+    // commit.seen = 该 commit 在 onData 中已放行的次数（0→1 放行本体，>1 丢弃重复）
+    commit: null,
+    // 最近一次已放行的 onData 文本（单一）
+    lastSent: null,
+    lastSentAt: 0,
+    // 最近 500ms 内已放行的 onData 文本列表（用于检测 fcitx5 逐字提交时的拼接重复）
+    // 真实 bug：用户输入「没有，」时，xterm 会额外发 onData "有,"（= "没有"后缀 + "," commit）
+    // 需要在已发送历史里找后缀才能识别
+    sentPool: [],
+  };
+}
+
+// 记录已发送文本到 sentPool（保留最近 5 条 / 500ms 内的）
+function imeRecordSent(guard, text) {
+  if (!text) return;
+  const now = Date.now();
+  guard.sentPool.push({ text: String(text), at: now });
+  // 清理超过 800ms 的旧记录，最多保留 5 条
+  guard.sentPool = guard.sentPool
+    .filter((s) => now - s.at < 800)
+    .slice(-5);
+}
+
+function imeMarkCommit(guard, text) {
+  if (!text) return;
+  const now = Date.now();
+  guard.commit = {
+    text: String(text),
+    until: now + 500,  // 放宽到 500ms，覆盖 fcitx5 慢速提交 + 物理键延迟补尾
+    seen: 0,
+  };
+}
+
+function imeIsPunctChar(ch) {
+  if (!ch || ch.length !== 1) return false;
+  for (const [hw, fw] of IME_PUNCT_PAIRS) {
+    if (ch === hw || ch === fw) return true;
+  }
+  return false;
+}
+
+// 判断候选 data 是否与最近 commit 构成重复（只读，不改 seen）。
+// 覆盖：完全相同 / 半全角 / 后缀片段 / 整数倍拼接 / 拼接+后缀
+function imeDataMatchesCommit(guard, data, now) {
+  const c = guard.commit;
+  if (!c || now > c.until) return false;
+  if (imeStrEq(data, c.text)) return true;
+  if (imeIsSuffixDup(data, c.text)) return true;
+  if (imeIsMultipleDup(data, c.text)) return true;
+  return false;
+}
+
+// onData 专用：commit 窗口内第一次匹配放行（seen 0→1），后续丢弃。
+function imeDataIsCommitDup(guard, data, now) {
+  if (!imeDataMatchesCommit(guard, data, now)) return false;
+  const c = guard.commit;
+  if (c.seen === 0) {
+    c.seen = 1;
+    return false;
+  }
+  return true;
+}
+
+function imeShouldBlockKey(guard, ev) {
+  if (!ev) return false;
+  // keydown 229/Process 必须放行
+  if (ev.type === 'keydown' && (ev.isComposing || ev.keyCode === 229 || ev.key === 'Process')) {
+    return false;
+  }
+  if (ev.type === 'keypress') {
+    if (ev.isComposing || guard.composing) return true;
+    const key = ev.key || '';
+    if (!key || ev.ctrlKey || ev.altKey || ev.metaKey) return false;
+    const now = Date.now();
+    const c = guard.commit;
+    // 仅当 commit 已被 onData 放行（seen>=1）后，再到的 keypress 才视为补尾重复
+    if (c && c.seen >= 1 && now <= c.until) {
+      if (imeDataMatchesCommit(guard, key, now)) return true;
+      if (imeIsPunctChar(key)) return true;
+    }
+  }
+  return false;
+}
+
+function imeFilterData(guard, data) {
+  if (data == null || data === '') return null;
+  const now = Date.now();
+
+  // 路径 1：短窗完全等价（< 100ms，含半全角）
+  if (
+    guard.lastSent != null &&
+    now - guard.lastSentAt < 100 &&
+    imeStrEq(data, guard.lastSent)
+  ) {
+    imeDiag('  → 去重[rapid]', data, { last: guard.lastSent });
+    return null;
+  }
+
+  // 路径 2：commit 窗口去重（核心）—— 第一份放行，后续所有匹配形态丢弃
+  if (imeDataIsCommitDup(guard, data, now)) {
+    imeDiag('  → 去重[commit]', data, { commit: guard.commit && guard.commit.text });
+    return null;
+  }
+
+  // 路径 3：lastSent 后缀兜底（不依赖 composition 事件）
+  // 时间窗放宽到 500ms，覆盖 fcitx5 各种延迟场景
+  if (
+    guard.lastSent != null &&
+    now - guard.lastSentAt < 500 &&
+    data.length < guard.lastSent.length &&
+    data.length <= 8 &&
+    imeIsSuffixDup(data, guard.lastSent)
+  ) {
+    imeDiag('  → 去重[lastSent-suffix]', data, { last: guard.lastSent });
+    return null;
+  }
+
+  // 路径 4：lastSent 整数倍拼接兜底（data = lastSent × N）
+  if (
+    guard.lastSent != null &&
+    now - guard.lastSentAt < 500 &&
+    data.length > guard.lastSent.length &&
+    imeIsMultipleDup(data, guard.lastSent)
+  ) {
+    imeDiag('  → 去重[lastSent-multiple]', data, { last: guard.lastSent });
+    return null;
+  }
+
+  // 路径 5：sentPool 后缀 + commit 拼接（fcitx5 逐字提交 + xterm textarea diff bug）
+  // 真实场景：用户输入「没有，」时
+  //   compositionend "没有" → onData "没有" → 发送（sentPool 里有"没有"）
+  //   compositionend ","   → onData ","   → 发送
+  //   ❌ xterm 又发 onData "有," （="没有"后缀"有" + commit","）
+  // 这条路径专门拦截这种拼接重复，是修复「打中文输符号重复」的关键。
+  if (
+    guard.commit && now <= guard.commit.until &&
+    guard.sentPool.length > 0
+  ) {
+    const sentTexts = guard.sentPool.map((s) => s.text);
+    if (imeIsSentSuffixPlusCommit(data, sentTexts, guard.commit.text)) {
+      imeDiag('  → 去重[sentPool+commit]', data, { commit: guard.commit.text, pool: sentTexts });
+      return null;
+    }
+  }
+
+  guard.lastSent = data;
+  guard.lastSentAt = now;
+  imeRecordSent(guard, data);
+  return data;
+}
+
+function installImeGuardOnTextarea(textarea, guard) {
+  if (!textarea || textarea._lotusImeGuard) return;
+  textarea._lotusImeGuard = true;
+
+  // 注意：WebKitGTK 可能不发 compositionstart，所以这里只作辅助标记
+  textarea.addEventListener('compositionstart', () => {
+    guard.composing = true;
+    guard.commit = null;
+    imeDiag('compositionstart', '');
+  }, true);
+
+  // compositionend 是主要锚点 —— 即使 isComposing=false 也记录提交文本
+  // 同时做「安全网」：记录 compositionend 触发时刻 + data，用于在 patch 失效时
+  // 主动发送（防止禁用 _finalizeComposition 后 input 路径也失效导致无法输入中文）
+  textarea.addEventListener('compositionend', (ev) => {
+    guard.composing = false;
+    const d = ev && ev.data;
+    if (d) imeMarkCommit(guard, d);
+    guard.lastCompositionEndAt = Date.now();
+    guard.lastCompositionEndData = d || '';
+    imeDiag('compositionend', d, { wasComposing: guard.composing, textareaLen: (textarea.value || '').length });
+  }, true);
+
+  // ====== 根治 xterm.js composition 重复（monkey-patch _finalizeComposition）======
+  // xterm 的 _finalizeComposition 在 compositionend 时会用 setTimeout(0) 从
+  // textarea.value 截取"从 compositionPosition.start 到末尾"的子串发送。
+  // 这在 fcitx5 逐字提交 + WebKitGTK 下会出错（textarea.value 累积了所有历史输入，
+  // 截取位置算错，导致发送 "有," 这种重复片段）。
+  //
+  // 修复：替换 _compositionHelper.compositionend 为空操作，让 xterm 不再做
+  // textarea 截取。正确的提交文本由浏览器原生的 input event → _handleAnyTextareaChanges
+  // 路径发送（它用 diff 算法，正确），或由我们自己通过 ev.data 发送。
+  //
+  // 注意：必须在 term.open() 之后、用户输入之前调用一次。
+  // 通过 textarea._lotusPatched 标记确保幂等。
+
+  // beforeinput / input 作为备选锚点（部分 WebKit 版本只发这些）
+  const recordAnchor = (ev) => {
+    if (!ev || !ev.data) return;
+    const t = ev.inputType || '';
+    imeDiag('input-event', ev.data, { type: t, composing: ev.isComposing });
+    if (
+      t === 'insertCompositionText' ||
+      t === 'insertFromComposition' ||
+      (t === 'insertText' && ev.isComposing)
+    ) {
+      imeMarkCommit(guard, ev.data);
+    }
+  };
+  textarea.addEventListener('beforeinput', recordAnchor, true);
+  textarea.addEventListener('input', (ev) => {
+    if (!ev || !ev.isComposing) return;
+    recordAnchor(ev);
+  }, true);
+}
+
+// ====== xterm composition 重复的根治（monkey-patch）======
+// 必须在 term.open() 后调用。返回 true 表示 patch 成功。
+// 原理：xterm 的 _finalizeComposition 会从 textarea.value 截取子串发送，
+// 在 fcitx5 + WebKitGTK 下会算错位置导致重复。我们替换它为空操作。
+// 正确的提交文本由 xterm 自己的 _handleAnyTextareaChanges（input event 路径）发送。
+function patchXtermComposition(term) {
+  if (!term || term._lotusCompPatched) return false;
+  try {
+    // xterm 4.x/5.x 公开实例的 _core 属性
+    const core = term._core;
+    if (!core) {
+      console.warn('[lotus] patchXtermComposition: term._core 不可访问，跳过');
+      return false;
+    }
+    // _compositionHelper 可能在 core 上，也可能在 core.renderService 等地方
+    let helper = null;
+    const candidates = [
+      core._compositionHelper,
+      core.compositionHelper,
+      core.renderService && core.renderService._compositionHelper,
+      core.inputHandler && core.inputHandler._compositionHelper,
+    ];
+    for (const c of candidates) {
+      if (c && typeof c.compositionend === 'function') { helper = c; break; }
+    }
+    // 另一种方式：直接遍历 core 的所有属性找 compositionHelper
+    if (!helper) {
+      for (const k of Object.keys(core)) {
+        const v = core[k];
+        if (v && typeof v === 'object' && typeof v.compositionend === 'function' && typeof v.compositionstart === 'function') {
+          helper = v;
+          break;
+        }
+      }
+    }
+    if (!helper) {
+      console.warn('[lotus] patchXtermComposition: 找不到 _compositionHelper，跳过');
+      return false;
+    }
+
+    // 备份原始方法（便于诊断和回退）
+    helper._lotusOrigFinalize = helper._finalizeComposition;
+    helper._lotusOrigCompositionEnd = helper.compositionend;
+
+    // 替换 compositionend：不再调用 _finalizeComposition
+    // xterm 的 _handleAnyTextareaChanges（监听 input 事件）会正确发送 diff
+    helper.compositionend = function () {
+      try {
+        // 只清理 isComposing 状态，不触发 textarea 截取
+        if (typeof this._isComposing !== 'undefined') this._isComposing = false;
+        if (this._compositionView && this._compositionView.classList) {
+          this._compositionView.classList.remove('active');
+        }
+      } catch (e) {}
+    };
+    // 同时禁用 _finalizeComposition 本身（keydown 路径会调用它）
+    helper._finalizeComposition = function () {
+      try {
+        if (typeof this._isComposing !== 'undefined') this._isComposing = false;
+        if (this._compositionView && this._compositionView.classList) {
+          this._compositionView.classList.remove('active');
+        }
+      } catch (e) {}
+    };
+
+    term._lotusCompPatched = true;
+    console.log('[lotus] ✓ xterm composition helper 已 patch（禁用 _finalizeComposition）');
+    imeDiag('patch-applied', 'xterm _finalizeComposition disabled');
+    return true;
+  } catch (e) {
+    console.error('[lotus] patchXtermComposition 失败:', e);
+    return false;
+  }
+}
+
 // ====== 创建 xterm.js 终端实例 ======
 // 注意：必须在 pane 可见（active）之后再 open + fit，否则容器尺寸为 0
 function createTerminal(tabId, cols, rows, projectId) {
@@ -158,6 +597,10 @@ function createTerminal(tabId, cols, rows, projectId) {
 
     term.open(pane);
 
+    // 根治 xterm composition 重复：monkey-patch _finalizeComposition
+    // 必须在 open() 之后（此时 _compositionHelper 已创建）
+    patchXtermComposition(term);
+
     // 多次 fit 解决字体异步加载导致字符宽度测量不准的问题
     // 字体没加载完时 fit 会算错 cols，导致字符显示分散
     const doFit = () => {
@@ -178,12 +621,19 @@ function createTerminal(tabId, cols, rows, projectId) {
       document.fonts.ready.then(doFit);
     }
 
-    // 键盘输入：转发给 Rust
+    // IME 去重状态（每终端一份）
+    const imeGuard = createImeInputGuard();
+
+    // 键盘输入：转发给 Rust（先过 IME 去重）
     term.onData((data) => {
+      // 标记：本次 onData 已处理（用于 compositionend 安全网）
+      imeGuard.lastOnDataAt = Date.now();
+      const filtered = imeFilterData(imeGuard, data);
+      if (filtered == null) return;  // 被 IME 去重丢弃（imeFilterData 内部已打日志）
       sendToBackend({
         type: 'input',
         tab_id: tabId,
-        data: btoa(unescape(encodeURIComponent(data))),
+        data: btoa(unescape(encodeURIComponent(filtered))),
       });
     });
 
@@ -197,6 +647,9 @@ function createTerminal(tabId, cols, rows, projectId) {
     //   Ctrl+V / Ctrl+Shift+V  → 粘贴
     //   Ctrl+Z                 → 中断当前进程（发送 SIGINT / \x03）
     term.attachCustomKeyEventHandler((ev) => {
+      // IME：阻止 composition 提交后的重复 keypress；keydown 229 仍放行
+      if (imeShouldBlockKey(imeGuard, ev)) return false;
+
       if (ev.type !== 'keydown' || !ev.ctrlKey || ev.altKey || ev.metaKey) return true;
       const key = (ev.key || '').toLowerCase();
 
@@ -227,11 +680,34 @@ function createTerminal(tabId, cols, rows, projectId) {
       return true;
     });
 
-    // 拦截 xterm 内部 textarea 的原生 paste：
-    // - 始终 preventDefault，避免 WebKit/xterm 再插一份
+    // 拦截 xterm 内部 textarea 的原生 paste + 挂 IME 监听
+    // - paste：始终 preventDefault，避免 WebKit/xterm 再插一份
     // - 若刚被 Ctrl+V 快捷键处理过，则不再粘贴（防止重复）
     const xtermTextarea = pane.querySelector('.xterm-helper-textarea');
     if (xtermTextarea) {
+      installImeGuardOnTextarea(xtermTextarea, imeGuard);
+
+      // compositionend 安全网：patch 掉 _finalizeComposition 后，如果 xterm 的
+      // input 事件路径也没把 commit 文本发出来（某些 WebKitGTK 极端情况），
+      // 就主动用 ev.data 发送，保证中文始终能输入。
+      // 检测：compositionend 后 60ms 内如果没有 onData 触发，主动补发。
+      xtermTextarea.addEventListener('compositionend', (ev) => {
+        const d = ev && ev.data;
+        if (!d) return;
+        const endAt = Date.now();
+        setTimeout(() => {
+          // 如果 compositionend 之后已经有 onData 触发过，说明 input 路径正常
+          if (imeGuard.lastOnDataAt && imeGuard.lastOnDataAt >= endAt - 5) return;
+          // 否则主动用 ev.data 发送
+          imeDiag('  → 安全网补发', d, { reason: 'no onData after compositionend' });
+          sendToBackend({
+            type: 'input',
+            tab_id: tabId,
+            data: btoa(unescape(encodeURIComponent(d))),
+          });
+        }, 60);
+      }, true);
+
       xtermTextarea.addEventListener('paste', (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
@@ -275,9 +751,22 @@ function handleServerMessage(msg) {
       // 创建前端终端实例 + tab UI（带 project_id 归属）
       createTerminal(msg.tab_id, msg.cols, msg.rows, msg.project_id);
       addTabUI(msg.tab_id, msg.title, msg.project_id);
-      // 只在 tab 属于当前项目时切换激活（避免后台项目的 tab 抢焦点）
-      if (msg.project_id === _currentProjectId) {
-        switchTab(msg.tab_id);
+      // activate 默认 true；会话批量恢复时仅 active tab 为 true
+      const shouldActivate = msg.activate !== false;
+      if (shouldActivate) {
+        // 记住各项目的 active（含非当前项目，切换项目时用）
+        activeTabByProject.set(msg.project_id, msg.tab_id);
+        if (msg.project_id === _currentProjectId) {
+          switchTab(msg.tab_id, { skipBackend: true });
+        }
+      } else {
+        // 非激活 tab：去掉 createTerminal 默认的 active，避免多 pane 同时高亮
+        const t = terminals.get(msg.tab_id);
+        if (t) {
+          t.pane.classList.remove('active');
+          const tabEl = document.querySelector(`.tab[data-tab-id="${msg.tab_id}"]`);
+          if (tabEl) tabEl.classList.remove('active');
+        }
       }
       hideLoading();
       break;
@@ -536,8 +1025,12 @@ function updateTabTitle(tabId, title) {
   if (tab) tab.textContent = title;
 }
 
-function switchTab(tabId) {
+function switchTab(tabId, opts) {
   setActiveTabId(tabId);
+  // 通知后端记住 active（会话持久化）；恢复流程里可 skip 避免回写抖动
+  if (!opts || !opts.skipBackend) {
+    sendToBackend({ type: 'switch_tab', tab_id: tabId });
+  }
   // 更新当前项目可见 tab 的高亮
   document.querySelectorAll('.tab').forEach((t) => {
     t.classList.toggle('active', t.dataset.tabId == tabId);

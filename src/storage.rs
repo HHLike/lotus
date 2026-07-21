@@ -1,8 +1,9 @@
-//! 数据持久化 —— 命令历史 + 目录书签
+//! 数据持久化 —— 命令历史 + 目录书签 + tab 会话
 //!
 //! 存储位置（XDG）：~/.local/share/lotus/
 //! - history.json   命令历史（最多 MAX_HISTORY 条）
 //! - bookmarks.json 目录书签
+//! - sessions.json  各项目的 tab 会话（标题/cwd/启动命令）
 //!
 //! 写入用原子写（temp + rename），避免崩溃损坏。
 
@@ -16,6 +17,8 @@ use crate::shell_integration::data_dir;
 
 const MAX_HISTORY: usize = 1000;
 const MAX_RECENTS: usize = 5;
+/// 每个项目最多记住的 tab 数（防止异常膨胀）
+const MAX_TABS_PER_PROJECT: usize = 32;
 
 // ============================ 历史记录 ============================
 
@@ -441,5 +444,127 @@ impl Default for ProjectStore {
             metas: HashMap::new(),
             next_id: 1,
         }
+    }
+}
+
+// ============================ Tab 会话（重启恢复）============================
+
+/// 单个 tab 的可持久化元数据（不保存终端输出缓冲）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TabSession {
+    pub project_id: u32,
+    pub title: String,
+    pub cwd: String,
+    /// 若该 tab 是用 LaunchAgent 等方式带命令启动的，重启后可重跑
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+/// 全局 tab 会话存储：`~/.local/share/lotus/sessions.json`
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SessionStore {
+    /// 所有项目的 tab，按创建顺序
+    pub tabs: Vec<TabSession>,
+    /// 每个项目当前激活 tab 在「该项目 tabs 子集」中的下标
+    #[serde(default)]
+    pub active_by_project: HashMap<u32, usize>,
+}
+
+impl SessionStore {
+    pub fn load() -> Self {
+        let path = match Self::path() {
+            Some(p) => p,
+            None => return Self::default(),
+        };
+        if !path.exists() {
+            return Self::default();
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<SessionStore>(&text) {
+                Ok(mut s) => {
+                    s.sanitize();
+                    s
+                }
+                Err(e) => {
+                    warn!("sessions.json 解析失败：{}", e);
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(),
+        }
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = Self::path().context("无法确定 sessions.json 路径")?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建目录失败: {}", parent.display()))?;
+        }
+        atomic_write_json(&path, self)
+    }
+
+    fn path() -> Option<PathBuf> {
+        Some(data_dir()?.join("sessions.json"))
+    }
+
+    /// 裁剪非法/过多条目，保证每个项目至少合理
+    fn sanitize(&mut self) {
+        // 丢弃 cwd 为空的异常项
+        self.tabs.retain(|t| !t.cwd.trim().is_empty());
+        // 每项目截断到上限（保留最后的 = 最近的）
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        let mut kept = Vec::with_capacity(self.tabs.len());
+        // 先从后往前选，再反转，保留各项目最近的 MAX 个
+        for t in self.tabs.drain(..).rev() {
+            let c = counts.entry(t.project_id).or_insert(0);
+            if *c < MAX_TABS_PER_PROJECT {
+                *c += 1;
+                kept.push(t);
+            }
+        }
+        kept.reverse();
+        self.tabs = kept;
+
+        // active 下标夹紧
+        let mut per_proj_len: HashMap<u32, usize> = HashMap::new();
+        for t in &self.tabs {
+            *per_proj_len.entry(t.project_id).or_insert(0) += 1;
+        }
+        self.active_by_project.retain(|pid, idx| {
+            match per_proj_len.get(pid) {
+                Some(&len) if len > 0 => {
+                    if *idx >= len {
+                        *idx = len - 1;
+                    }
+                    true
+                }
+                _ => false,
+            }
+        });
+    }
+
+    /// 用当前运行时 tab 快照整体替换并保存
+    pub fn replace_from(
+        &mut self,
+        tabs: Vec<TabSession>,
+        active_tab_ids: &HashMap<u32, u32>, // project_id -> tab_id
+        runtime_tabs: &[(u32, u32)],        // (tab_id, project_id) 有序
+    ) {
+        self.tabs = tabs;
+        self.active_by_project.clear();
+
+        // 建立 project -> 该项目 runtime tab_id 有序列表
+        let mut ids_by_proj: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (tid, pid) in runtime_tabs {
+            ids_by_proj.entry(*pid).or_default().push(*tid);
+        }
+        for (pid, active_tid) in active_tab_ids {
+            if let Some(ids) = ids_by_proj.get(pid) {
+                if let Some(idx) = ids.iter().position(|id| id == active_tid) {
+                    self.active_by_project.insert(*pid, idx);
+                }
+            }
+        }
+        self.sanitize();
     }
 }

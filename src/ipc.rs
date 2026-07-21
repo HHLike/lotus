@@ -7,6 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 
+fn default_true() -> bool {
+    true
+}
+
 /// 配置载荷（扁平结构，给设置面板读写用）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigPayload {
@@ -191,6 +195,9 @@ pub enum ServerMessage {
         cols: u16,
         rows: u16,
         project_id: u32,
+        /// 是否立刻激活（批量恢复会话时仅 active tab 为 true）
+        #[serde(default = "default_true")]
+        activate: bool,
     },
     /// tab 已关闭
     #[serde(rename = "tab_closed")]

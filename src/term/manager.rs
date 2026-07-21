@@ -39,10 +39,23 @@ struct Tab {
     /// PTY 句柄（用于写输入、resize、kill）
     handle: PtyHandle,
     /// 当前标题（从 OSC 序列解析，或默认用 cwd）
-    #[allow(dead_code)]
     title: String,
     /// 该 tab 所属的项目 id（用于切换项目时过滤显示，不杀 PTY）
     project_id: u32,
+    /// 最近已知的工作目录（shell integration / 创建时）
+    cwd: String,
+    /// 启动时附带的命令（agent 等），用于会话恢复重跑
+    command: Option<String>,
+}
+
+/// 对外暴露的 tab 快照（会话持久化用）
+#[derive(Debug, Clone)]
+pub struct TabInfo {
+    pub tab_id: u32,
+    pub project_id: u32,
+    pub title: String,
+    pub cwd: String,
+    pub command: Option<String>,
 }
 
 /// 终端 Manager：管理所有 tab
@@ -51,6 +64,8 @@ pub struct TermManager {
     next_id: u32,
     /// 所有活跃的 tab
     tabs: HashMap<u32, Tab>,
+    /// tab 创建顺序（用于 UI / 会话恢复顺序）
+    tab_order: Vec<u32>,
     /// shell 路径
     shell: String,
     /// 默认 cwd
@@ -72,6 +87,7 @@ impl TermManager {
         Self {
             next_id: 1,
             tabs: HashMap::new(),
+            tab_order: Vec::new(),
             shell,
             default_cwd,
             init_file,
@@ -149,15 +165,19 @@ impl TermManager {
             })
             .ok();
 
-        let title = self.default_cwd.clone();
+        let cwd_owned = cwd.to_string();
+        let title = cwd_owned.clone();
         self.tabs.insert(
             tab_id,
             Tab {
                 handle,
                 title,
                 project_id,
+                cwd: cwd_owned,
+                command: None,
             },
         );
+        self.tab_order.push(tab_id);
 
         Ok(tab_id)
     }
@@ -186,13 +206,30 @@ impl TermManager {
         if let Some(mut tab) = self.tabs.remove(&tab_id) {
             let _ = tab.handle.kill();
         }
+        self.tab_order.retain(|id| *id != tab_id);
     }
 
     /// 更新 tab 标题（OSC 序列解析后调用）
-    #[allow(dead_code)]
     pub fn set_title(&mut self, tab_id: u32, title: String) {
         if let Some(tab) = self.tabs.get_mut(&tab_id) {
             tab.title = title;
+        }
+    }
+
+    /// 更新 tab 最近 cwd（shell integration 上报）
+    pub fn set_cwd(&mut self, tab_id: u32, cwd: String) {
+        if cwd.trim().is_empty() {
+            return;
+        }
+        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            tab.cwd = cwd;
+        }
+    }
+
+    /// 记录 tab 的启动命令（agent 恢复用）
+    pub fn set_command(&mut self, tab_id: u32, command: Option<String>) {
+        if let Some(tab) = self.tabs.get_mut(&tab_id) {
+            tab.command = command.filter(|c| !c.trim().is_empty());
         }
     }
 
@@ -201,9 +238,25 @@ impl TermManager {
         self.default_cwd = cwd;
     }
 
-    /// 列出所有 tab id（切换项目时关闭所有 tab 用）
+    /// 列出所有 tab id（按创建顺序）
     pub fn list_tab_ids(&self) -> Vec<u32> {
-        self.tabs.keys().copied().collect()
+        self.tab_order.clone()
+    }
+
+    /// 有序 tab 快照（会话持久化）
+    pub fn list_tabs(&self) -> Vec<TabInfo> {
+        self.tab_order
+            .iter()
+            .filter_map(|id| {
+                self.tabs.get(id).map(|t| TabInfo {
+                    tab_id: *id,
+                    project_id: t.project_id,
+                    title: t.title.clone(),
+                    cwd: t.cwd.clone(),
+                    command: t.command.clone(),
+                })
+            })
+            .collect()
     }
 
     /// 判断某项目是否还有存活的 tab（切换项目时空项目判断用）
@@ -216,6 +269,7 @@ impl TermManager {
         for (_, mut tab) in self.tabs.drain() {
             let _ = tab.handle.kill();
         }
+        self.tab_order.clear();
     }
 }
 

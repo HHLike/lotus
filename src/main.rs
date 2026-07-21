@@ -34,7 +34,9 @@ use crate::ipc::{
     AgentInfoPayload, BookmarkEntryPayload, ClientMessage, ConfigPayload, HistoryEntryPayload,
     ProjectPayload, ServerMessage, ThemePayload,
 };
-use crate::storage::{now_ts, BookmarkStore, HistoryEntry, HistoryStore, ProjectStore};
+use crate::storage::{
+    now_ts, BookmarkStore, HistoryEntry, HistoryStore, ProjectStore, SessionStore, TabSession,
+};
 use crate::term::{TermEvent, TermManager};
 use crate::theme::{rgb_to_css, Theme};
 
@@ -50,7 +52,7 @@ struct AppState {
     theme: Theme,
     /// 配置（设置面板读写）
     config: Config,
-    /// 首个 tab 是否已创建
+    /// 首个 tab 是否已创建（含会话恢复）
     first_tab_created: bool,
     // ===== 项目（Workspace）=====
     /// 项目元数据存储
@@ -66,6 +68,8 @@ struct AppState {
     /// tab 当前正在跑的命令（用于时长统计 / agent 通知）
     /// tab_id -> (cmd, started_at)
     running_cmds: HashMap<u32, (String, Instant)>,
+    /// 每项目当前激活的 tab_id（会话恢复 / 切换项目用）
+    active_tab_by_project: HashMap<u32, u32>,
 }
 
 const FRAME_RESIZE_MARGIN: f64 = 6.0;
@@ -223,6 +227,19 @@ fn main() -> Result<()> {
     // GTK 必须在主线程最早初始化
     gtk::init().context("gtk::init 失败")?;
 
+    // 清空 WebKitGTK 磁盘缓存，确保开发期 file:// 下的 app.js 修改立即生效。
+    // WebKitGTK 默认会缓存 file:// 资源（尤其是 JS 字节码缓存），导致前端改了不生效。
+    if let Ok(home) = std::env::var("HOME") {
+        for cache_sub in &[".cache/webkitgtk-4.1", ".local/share/webkitgtk-4.1"] {
+            let cache_dir = std::path::PathBuf::from(&home).join(cache_sub);
+            if cache_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&cache_dir) {
+                    warn!("清空 WebKit 缓存 {} 失败: {}", cache_dir.display(), e);
+                }
+            }
+        }
+    }
+
     // 创建 PTY 事件 channel + Manager（用当前项目的 cwd 作为默认目录）
     let (event_tx, event_rx) = std::sync::mpsc::channel::<TermEvent>();
     let manager = TermManager::new(shell, project_cwd.clone(), event_tx, init_file);
@@ -241,6 +258,7 @@ fn main() -> Result<()> {
         bookmarks,
         recents,
         running_cmds: HashMap::new(),
+        active_tab_by_project: HashMap::new(),
     }));
 
     // ====== 创建 GTK 窗口 ======
@@ -286,6 +304,11 @@ fn main() -> Result<()> {
             settings.set_enable_javascript(true);
             settings.set_enable_developer_extras(true);
             settings.set_javascript_can_open_windows_automatically(true);
+            // 开发期：禁用磁盘缓存 + 关闭离线 Web 应用缓存，确保 file:// 下的
+            // app.js 修改能立即生效（避免 WebKitGTK 用旧缓存导致调试时改了不生效）
+            settings.set_enable_offline_web_application_cache(false);
+            // 注意：webkit2gtk 0.18 没有直接的 set_cache_model，缓存通过
+            // FRESHNESS（file:// 自动 stat）+ 下面启动时清空缓存目录来保证
         }
     }
 
@@ -490,13 +513,18 @@ fn main() -> Result<()> {
                 }
             }
             // 命令开始 → 记录时间 + 通知前端（tab 忙碌徽章）
+            let mut session_dirty = false;
             for (tab_id, cmd, cwd) in command_starts {
                 if cmd.trim().is_empty() {
                     continue;
                 }
+                if let Some(m) = s.manager.as_mut() {
+                    m.set_cwd(tab_id, cwd.clone());
+                }
                 s.running_cmds
                     .insert(tab_id, (cmd.clone(), Instant::now()));
                 to_send.push(ServerMessage::CommandStarted { tab_id, cmd, cwd });
+                session_dirty = true;
             }
             // 处理捕获到的命令（这时 rx 借用已结束）
             for (tab_id, cmd, cwd, code) in command_runs {
@@ -504,6 +532,10 @@ fn main() -> Result<()> {
                 if cmd.trim().is_empty() {
                     continue;
                 }
+                if let Some(m) = s.manager.as_mut() {
+                    m.set_cwd(tab_id, cwd.clone());
+                }
+                session_dirty = true;
                 let duration_ms = s
                     .running_cmds
                     .remove(&tab_id)
@@ -548,9 +580,15 @@ fn main() -> Result<()> {
             // 处理已退出的 tab（这时 rx 借用已结束）
             for tab_id in &exited_tabs {
                 s.running_cmds.remove(tab_id);
+                // 清理 active 映射
+                s.active_tab_by_project.retain(|_, tid| *tid != *tab_id);
                 if let Some(m) = s.manager.as_mut() {
                     m.close_tab(*tab_id);
                 }
+                session_dirty = true;
+            }
+            if session_dirty {
+                persist_sessions(&s);
             }
             // 加上 pending_outputs（IPC handler 累积的）
             if !s.pending_outputs.is_empty() {
@@ -590,8 +628,9 @@ fn main() -> Result<()> {
     info!("进入 GTK 主循环");
     gtk::main();
 
-    // 退出清理
+    // 退出清理：先落盘 tab 会话，再杀 PTY
     let mut s = state.lock().unwrap();
+    persist_sessions(&s);
     if let Some(m) = s.manager.as_mut() {
         m.close_all();
     }
@@ -635,21 +674,13 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
             });
             if !s.first_tab_created {
                 s.first_tab_created = true;
-                let pid = s.current_project_id;
-                if let Some(m) = s.manager.as_mut() {
-                    match m.create_tab(80, 24, None, pid) {
-                        Ok(tab_id) => {
-                            info!("创建首个 tab: {}", tab_id);
-                            s.pending_outputs.push(ServerMessage::TabCreated {
-                                tab_id,
-                                title: "lotus".to_string(),
-                                cols: 80,
-                                rows: 24,
-                                project_id: pid,
-                            });
-                        }
-                        Err(e) => error!("创建首个 tab 失败: {}", e),
-                    }
+                // 恢复上次会话的全部 tab；若无会话则开 1 个默认 tab
+                let delayed = restore_sessions(&mut s);
+                // 延迟写入恢复的 agent 命令（需等 shell 初始化）
+                if !delayed.is_empty() {
+                    drop(s);
+                    schedule_tab_commands(state, delayed);
+                    return;
                 }
             }
         }
@@ -669,25 +700,69 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
                 match m.create_tab(80, 24, None, pid) {
                     Ok(tab_id) => {
                         info!("新建 tab: {}", tab_id);
+                        let title = format!("lotus {}", tab_id);
+                        m.set_title(tab_id, title.clone());
+                        s.active_tab_by_project.insert(pid, tab_id);
                         s.pending_outputs.push(ServerMessage::TabCreated {
                             tab_id,
-                            title: format!("lotus {}", tab_id),
+                            title,
                             cols: 80,
                             rows: 24,
                             project_id: pid,
+                            activate: true,
                         });
+                        persist_sessions(&s);
                     }
                     Err(e) => error!("新建 tab 失败: {}", e),
                 }
             }
         }
         ClientMessage::CloseTab { tab_id } => {
+            // 记录所属项目，便于关闭后选下一个 active
+            let proj = s
+                .manager
+                .as_ref()
+                .and_then(|m| m.list_tabs().into_iter().find(|t| t.tab_id == tab_id))
+                .map(|t| t.project_id);
             if let Some(m) = s.manager.as_mut() {
                 m.close_tab(tab_id);
             }
+            s.running_cmds.remove(&tab_id);
+            if let Some(pid) = proj {
+                if s.active_tab_by_project.get(&pid) == Some(&tab_id) {
+                    // 选同项目剩余第一个
+                    let next = s.manager.as_ref().and_then(|m| {
+                        m.list_tabs()
+                            .into_iter()
+                            .find(|t| t.project_id == pid)
+                            .map(|t| t.tab_id)
+                    });
+                    match next {
+                        Some(nid) => {
+                            s.active_tab_by_project.insert(pid, nid);
+                        }
+                        None => {
+                            s.active_tab_by_project.remove(&pid);
+                        }
+                    }
+                }
+            } else {
+                s.active_tab_by_project.retain(|_, tid| *tid != tab_id);
+            }
             s.pending_outputs.push(ServerMessage::TabClosed { tab_id });
+            persist_sessions(&s);
         }
-        ClientMessage::SwitchTab { tab_id: _ } => {}
+        ClientMessage::SwitchTab { tab_id } => {
+            if let Some(pid) = s.manager.as_ref().and_then(|m| {
+                m.list_tabs()
+                    .into_iter()
+                    .find(|t| t.tab_id == tab_id)
+                    .map(|t| t.project_id)
+            }) {
+                s.active_tab_by_project.insert(pid, tab_id);
+                persist_sessions(&s);
+            }
+        }
         ClientMessage::Resize { tab_id, cols, rows } => {
             if let Some(m) = s.manager.as_mut() {
                 if let Err(e) = m.resize(tab_id, cols, rows) {
@@ -857,6 +932,26 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
         ClientMessage::DeleteProject { id } => {
             if s.projects.delete(id) {
                 info!("删除项目 id={}", id);
+                // 关掉该项目下所有 tab，并清 active
+                let to_close: Vec<u32> = s
+                    .manager
+                    .as_ref()
+                    .map(|m| {
+                        m.list_tabs()
+                            .into_iter()
+                            .filter(|t| t.project_id == id)
+                            .map(|t| t.tab_id)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for tid in to_close {
+                    if let Some(m) = s.manager.as_mut() {
+                        m.close_tab(tid);
+                    }
+                    s.running_cmds.remove(&tid);
+                    s.pending_outputs.push(ServerMessage::TabClosed { tab_id: tid });
+                }
+                s.active_tab_by_project.remove(&id);
                 // 如果删的是当前项目，切到第一个剩余项目
                 if s.current_project_id == id {
                     let first_id = s.projects.list().first().map(|m| m.id);
@@ -876,6 +971,7 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
                     })
                     .collect();
                 s.pending_outputs.push(ServerMessage::ProjectsList { entries });
+                persist_sessions(&s);
             }
         }
         ClientMessage::RenameProject { id, name } => {
@@ -952,49 +1048,23 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
                 match m.create_tab(80, 24, run_cwd.as_deref(), pid) {
                     Ok(tab_id) => {
                         info!("启动 agent tab {} → {}", tab_id, command);
+                        m.set_title(tab_id, tab_title.clone());
+                        m.set_command(tab_id, Some(command.clone()));
+                        s.active_tab_by_project.insert(pid, tab_id);
                         s.pending_outputs.push(ServerMessage::TabCreated {
                             tab_id,
                             title: tab_title.clone(),
                             cols: 80,
                             rows: 24,
                             project_id: pid,
+                            activate: true,
                         });
+                        persist_sessions(&s);
                         // shell 初始化需要一点时间，延迟写入启动命令
-                        let cmd = command.clone();
-                        let state_launch = {
-                            // 通过 pending 无法延迟；用 glib timeout + 再锁 state
-                            // 这里把 command/tab_id 交给闭包
-                            (tab_id, cmd)
-                        };
-                        // 注意：不能在持有 MutexGuard 时嵌套 lock，先 drop s
                         drop(s);
-                        let (tab_id, cmd) = state_launch;
-                        let state2 = Arc::clone(state);
-                        gtk::glib::timeout_add_local_once(
-                            std::time::Duration::from_millis(350),
-                            move || {
-                                let mut st = state2.lock().unwrap();
-                                if let Some(m) = st.manager.as_mut() {
-                                    let mut line = cmd;
-                                    line.push('\n');
-                                    if let Err(e) = m.write(tab_id, line.as_bytes()) {
-                                        warn!("LaunchAgent 写入失败: {}", e);
-                                    } else {
-                                        // 乐观标记 running（shell integration 稍后会校正）
-                                        st.running_cmds
-                                            .insert(tab_id, (line.trim().to_string(), Instant::now()));
-                                        st.pending_outputs.push(ServerMessage::CommandStarted {
-                                            tab_id,
-                                            cmd: line.trim().to_string(),
-                                            cwd: String::new(),
-                                        });
-                                        st.pending_outputs.push(ServerMessage::TitleChanged {
-                                            tab_id,
-                                            title: tab_title,
-                                        });
-                                    }
-                                }
-                            },
+                        schedule_tab_commands(
+                            state,
+                            vec![(tab_id, command, tab_title)],
                         );
                         return;
                     }
@@ -1126,7 +1196,183 @@ fn which_bin(bin: &str) -> Option<String> {
     None
 }
 
-/// 切换项目：持久化旧项目 → 关闭所有 tab → 加载新项目数据 → 开新 tab → 更新快照 → 推消息
+/// 把当前全部 tab 元数据写入 sessions.json（重启后恢复用）
+fn persist_sessions(s: &AppState) {
+    let Some(m) = s.manager.as_ref() else {
+        return;
+    };
+    let infos = m.list_tabs();
+    let runtime: Vec<(u32, u32)> = infos.iter().map(|t| (t.tab_id, t.project_id)).collect();
+    let tabs: Vec<TabSession> = infos
+        .into_iter()
+        .map(|t| TabSession {
+            project_id: t.project_id,
+            title: t.title,
+            cwd: t.cwd,
+            command: t.command,
+        })
+        .collect();
+    let mut store = SessionStore::default();
+    store.replace_from(tabs, &s.active_tab_by_project, &runtime);
+    if let Err(e) = store.save() {
+        warn!("保存 tab 会话失败：{}", e);
+    }
+}
+
+/// 启动时从 sessions.json 恢复各项目 tab。
+/// 返回需要延迟写入 PTY 的 (tab_id, command, title) 列表（agent 重跑）。
+fn restore_sessions(s: &mut AppState) -> Vec<(u32, String, String)> {
+    let store = SessionStore::load();
+    let active_by_project = store.active_by_project.clone();
+    // 只恢复仍然存在的项目
+    let mut pending: Vec<TabSession> = store
+        .tabs
+        .into_iter()
+        .filter(|t| s.projects.get(t.project_id).is_some())
+        .collect();
+
+    // 若当前项目一条都没有，补一个默认 tab 描述
+    let cur = s.current_project_id;
+    if !pending.iter().any(|t| t.project_id == cur) {
+        let cwd = s
+            .projects
+            .get(cur)
+            .map(|m| expand_user_path(&m.cwd))
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "/".into())
+            });
+        pending.push(TabSession {
+            project_id: cur,
+            title: "lotus".into(),
+            cwd,
+            command: None,
+        });
+    }
+
+    // 计算每个项目的 active 下标
+    let mut idx_in_proj: HashMap<u32, usize> = HashMap::new();
+    let mut delayed: Vec<(u32, String, String)> = Vec::new();
+
+    info!("恢复 tab 会话：共 {} 个", pending.len());
+
+    for sess in pending {
+        let pid = sess.project_id;
+        let local_idx = *idx_in_proj.entry(pid).or_insert(0);
+        *idx_in_proj.get_mut(&pid).unwrap() += 1;
+
+        let active_idx = active_by_project.get(&pid).copied().unwrap_or(0);
+        // 该项目无记录时默认激活第 0 个；否则按记录的下标
+        let activate = local_idx == active_idx
+            || (local_idx == 0 && !active_by_project.contains_key(&pid));
+
+        let cwd = expand_user_path(&sess.cwd);
+        let title = if sess.title.trim().is_empty() {
+            "lotus".to_string()
+        } else {
+            sess.title.clone()
+        };
+
+        let created = s.manager.as_mut().and_then(|m| {
+            match m.create_tab(80, 24, Some(&cwd), pid) {
+                Ok(tab_id) => {
+                    m.set_title(tab_id, title.clone());
+                    if let Some(cmd) = sess.command.clone() {
+                        m.set_command(tab_id, Some(cmd));
+                    }
+                    Some(tab_id)
+                }
+                Err(e) => {
+                    error!("恢复 tab 失败 (project={}, cwd={}): {}", pid, cwd, e);
+                    None
+                }
+            }
+        });
+
+        if let Some(tab_id) = created {
+            if activate {
+                s.active_tab_by_project.insert(pid, tab_id);
+            }
+            s.pending_outputs.push(ServerMessage::TabCreated {
+                tab_id,
+                title: title.clone(),
+                cols: 80,
+                rows: 24,
+                project_id: pid,
+                activate,
+            });
+            if let Some(cmd) = sess.command {
+                if !cmd.trim().is_empty() {
+                    delayed.push((tab_id, cmd, title));
+                }
+            }
+        }
+    }
+
+    // 若恢复过程中当前项目仍无 tab（全失败），兜底开一个
+    let has_cur = s
+        .manager
+        .as_ref()
+        .map(|m| m.has_tabs_for_project(cur))
+        .unwrap_or(false);
+    if !has_cur {
+        if let Some(m) = s.manager.as_mut() {
+            match m.create_tab(80, 24, None, cur) {
+                Ok(tab_id) => {
+                    m.set_title(tab_id, "lotus".into());
+                    s.active_tab_by_project.insert(cur, tab_id);
+                    s.pending_outputs.push(ServerMessage::TabCreated {
+                        tab_id,
+                        title: "lotus".into(),
+                        cols: 80,
+                        rows: 24,
+                        project_id: cur,
+                        activate: true,
+                    });
+                }
+                Err(e) => error!("兜底创建 tab 失败: {}", e),
+            }
+        }
+    }
+
+    persist_sessions(s);
+    delayed
+}
+
+/// 延迟把命令写入新 tab 的 PTY（等 shell 初始化）
+fn schedule_tab_commands(state: &Arc<Mutex<AppState>>, items: Vec<(u32, String, String)>) {
+    if items.is_empty() {
+        return;
+    }
+    let state2 = Arc::clone(state);
+    gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+        let mut st = state2.lock().unwrap();
+        for (tab_id, cmd, title) in items {
+            if let Some(m) = st.manager.as_mut() {
+                let mut line = cmd;
+                line.push('\n');
+                if let Err(e) = m.write(tab_id, line.as_bytes()) {
+                    warn!("恢复/启动命令写入 tab {} 失败: {}", tab_id, e);
+                } else {
+                    st.running_cmds
+                        .insert(tab_id, (line.trim().to_string(), Instant::now()));
+                    st.pending_outputs.push(ServerMessage::CommandStarted {
+                        tab_id,
+                        cmd: line.trim().to_string(),
+                        cwd: String::new(),
+                    });
+                    st.pending_outputs.push(ServerMessage::TitleChanged {
+                        tab_id,
+                        title,
+                    });
+                }
+            }
+        }
+    });
+}
+
+/// 切换项目：持久化旧项目历史/书签 → 不杀 tab → 加载新项目数据 → 必要时开新 tab
 fn switch_project_in_state(s: &mut AppState, new_id: u32) {
     // 目标项目必须存在
     let new_meta = match s.projects.get(new_id).cloned() {
@@ -1183,13 +1429,17 @@ fn switch_project_in_state(s: &mut AppState, new_id: u32) {
             match m.create_tab(80, 24, Some(&expanded), new_id) {
                 Ok(tab_id) => {
                     info!("新项目首个 tab: {}", tab_id);
+                    m.set_title(tab_id, new_meta.name.clone());
+                    s.active_tab_by_project.insert(new_id, tab_id);
                     s.pending_outputs.push(ServerMessage::TabCreated {
                         tab_id,
                         title: new_meta.name.clone(),
                         cols: 80,
                         rows: 24,
                         project_id: new_id,
+                        activate: true,
                     });
+                    persist_sessions(s);
                 }
                 Err(e) => error!("新项目创建 tab 失败：{}", e),
             }
