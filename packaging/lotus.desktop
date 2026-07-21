@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Lotus
+GenericName=Terminal
+GenericName[zh_CN]=终端
+Comment=OTTY-style native terminal for Linux
+Comment[zh_CN]=OTTY 风格的原生 Linux 终端
+Exec=lotus
+Icon=lotus
+Terminal=false
+Categories=System;TerminalEmulator;Utility;
+Keywords=shell;prompt;command;commandline;cmd;terminal;agent;
+StartupNotify=true
+StartupWMClass=lotus

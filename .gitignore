@@ -1,0 +1,27 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# 打包产物
+/dist/
+*.deb
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 环境 / 本地配置
+.env
+.env.*
+*.local
+
+# 日志
+*.log
+
+# 系统
+Thumbs.db

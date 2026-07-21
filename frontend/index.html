@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Lotus 🪷</title>
+  <!-- xterm.js（本地打包，不依赖 CDN/网络） -->
+  <link rel="stylesheet" href="vendor/xterm.css" />
+  <script src="vendor/xterm.min.js"></script>
+  <script src="vendor/xterm-addon-fit.min.js"></script>
+  <script src="vendor/xterm-addon-web-links.min.js"></script>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- 顶部标题栏（可拖拽） -->
+  <header id="title-bar">
+    <div class="title-left">
+      <span class="app-icon">🪷</span>
+      <span class="app-name">Lotus</span>
+    </div>
+    <div class="title-center">
+      <span id="workspace-name">workspace</span>
+    </div>
+    <div class="title-right">
+      <button class="title-btn" id="btn-min" title="最小化">—</button>
+      <button class="title-btn" id="btn-max" title="最大化">☐</button>
+      <button class="title-btn close" id="btn-close" title="关闭">✕</button>
+    </div>
+  </header>
+
+  <div id="main">
+    <!-- 左侧边栏 -->
+    <aside id="sidebar">
+      <nav class="sidebar-nav">
+        <button class="nav-item active" data-view="terminal" title="终端">
+          <span class="nav-icon">▶</span><span class="nav-label">终端</span>
+        </button>
+        <button class="nav-item" data-view="agents" title="Agents">
+          <span class="nav-icon">✦</span><span class="nav-label">Agents</span>
+        </button>
+        <button class="nav-item" data-view="history" title="历史">
+          <span class="nav-icon">🕘</span><span class="nav-label">历史</span>
+        </button>
+        <button class="nav-item" data-view="bookmarks" title="书签">
+          <span class="nav-icon">★</span><span class="nav-label">书签</span>
+        </button>
+        <button class="nav-item" data-view="settings" title="设置">
+          <span class="nav-icon">⚙</span><span class="nav-label">设置</span>
+        </button>
+      </nav>
+      <!-- 项目区（切换/新建项目） -->
+      <div class="sidebar-section" id="sidebar-projects-section">
+        <div class="section-title">
+          项目
+          <span class="add-btn" id="add-project-btn" title="新建项目">+</span>
+        </div>
+        <div id="sidebar-projects">
+          <div class="section-item empty-hint">加载中...</div>
+        </div>
+      </div>
+      <div class="sidebar-section" id="sidebar-recents-section">
+        <div class="section-title">最近</div>
+        <div id="sidebar-recents">
+          <div class="section-item empty-hint">暂无记录</div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 右侧主区域 -->
+    <div id="content">
+      <!-- 标签栏 -->
+      <div id="tab-bar">
+        <div id="tabs"></div>
+        <button id="new-tab-btn" title="新标签 (Ctrl+T)">+</button>
+      </div>
+
+      <!-- 终端容器（每个 tab 一个 xterm 实例） -->
+      <div id="terminals"></div>
+    </div>
+
+    <!-- Agents 面板 -->
+    <div id="view-agents" class="view hidden">
+      <div class="list-header">
+        <h1>Agents</h1>
+        <button class="footer-btn secondary" id="refresh-agents-btn" type="button">刷新探测</button>
+      </div>
+      <div class="agents-intro">
+        一键在新标签启动编码 Agent CLI。Lotus 会跟踪命令状态、显示 tab 徽章，并在长任务完成时通知你。
+      </div>
+      <div class="list-body" id="agents-list">
+        <div class="empty-state">正在探测本机 Agent…</div>
+      </div>
+      <div class="list-footer agents-custom-launch">
+        <input type="text" id="custom-agent-cmd" placeholder="自定义命令，如：claude --dangerously-skip-permissions" />
+        <button class="footer-btn primary" id="custom-agent-launch" type="button">启动</button>
+      </div>
+    </div>
+
+    <!-- 设置面板（与 #content 同级，点侧边栏"设置"切换显示） -->
+    <div id="view-settings" class="view hidden">
+      <div class="settings-header">
+        <h1>设置</h1>
+      </div>
+      <div class="settings-body">
+
+        <!-- ===== 外观分区 ===== -->
+        <section class="settings-section">
+          <h2 class="section-title">外观</h2>
+
+          <div class="settings-row">
+            <label class="row-label" for="setting-theme">主题</label>
+            <div class="row-control">
+              <select id="setting-theme"></select>
+              <span class="row-hint">实时预览，保存后下次启动生效</span>
+            </div>
+          </div>
+
+          <div class="settings-row">
+            <label class="row-label" for="setting-opacity">窗口透明度</label>
+            <div class="row-control">
+              <input type="range" id="setting-opacity" min="50" max="100" value="100" step="5" />
+              <span class="row-value" id="setting-opacity-value">100%</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- ===== 字体分区 ===== -->
+        <section class="settings-section">
+          <h2 class="section-title">字体</h2>
+
+          <div class="settings-row">
+            <label class="row-label" for="setting-font">字体</label>
+            <div class="row-control">
+              <select id="setting-font"></select>
+            </div>
+          </div>
+
+          <div class="settings-row">
+            <label class="row-label" for="setting-font-size">字号</label>
+            <div class="row-control">
+              <button class="num-btn" id="font-size-minus" type="button">−</button>
+              <input type="number" id="setting-font-size" min="10" max="32" value="14" />
+              <button class="num-btn" id="font-size-plus" type="button">+</button>
+              <span class="row-hint">10 ~ 32</span>
+            </div>
+          </div>
+
+          <div class="settings-row">
+            <label class="row-label">预览</label>
+            <div class="row-control">
+              <div class="font-preview" id="font-preview">$ echo "Hello 莲花" —— The quick brown fox</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ===== Shell 分区 ===== -->
+        <section class="settings-section">
+          <h2 class="section-title">Shell</h2>
+
+          <div class="settings-row">
+            <label class="row-label" for="setting-shell">默认 Shell</label>
+            <div class="row-control">
+              <select id="setting-shell"></select>
+              <span class="row-hint">仅对新标签页生效</span>
+            </div>
+          </div>
+        </section>
+
+      </div>
+
+      <!-- 底部按钮栏 -->
+      <div class="settings-footer">
+        <span class="save-status" id="save-status"></span>
+        <button class="footer-btn secondary" id="reset-btn" type="button">重置默认</button>
+        <button class="footer-btn primary" id="save-btn" type="button">保存设置</button>
+      </div>
+    </div>
+
+    <!-- 历史面板 -->
+    <div id="view-history" class="view hidden">
+      <div class="list-header">
+        <h1>历史</h1>
+        <input type="text" class="search-box" id="history-search" placeholder="🔍 搜索命令..." />
+      </div>
+      <div class="list-body" id="history-list">
+        <div class="empty-state">暂无历史记录，执行命令后会显示在这里</div>
+      </div>
+      <div class="list-footer">
+        <span class="list-count" id="history-count">共 0 条</span>
+        <button class="footer-btn secondary" id="clear-history-btn" type="button">清空历史</button>
+      </div>
+    </div>
+
+    <!-- 书签面板 -->
+    <div id="view-bookmarks" class="view hidden">
+      <div class="list-header">
+        <h1>书签</h1>
+      </div>
+      <div class="list-body" id="bookmarks-list">
+        <div class="empty-state">暂无书签，使用下方表单添加</div>
+      </div>
+      <div class="list-footer add-bookmark-form">
+        <input type="text" id="bookmark-name" placeholder="名称（如：项目目录）" />
+        <input type="text" id="bookmark-path" placeholder="路径（如：~/work）" />
+        <button class="footer-btn primary" id="add-bookmark-btn" type="button">添加</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 加载提示 -->
+  <div id="loading">
+    <div class="loading-icon">🪷</div>
+    <div class="loading-text">Lotus 启动中...</div>
+  </div>
+
+  <!-- 新建项目对话框 -->
+  <div id="new-project-modal" class="modal hidden">
+    <div class="modal-overlay"></div>
+    <div class="modal-content">
+      <h2>新建项目</h2>
+      <div class="modal-form">
+        <label>
+          <span>项目名称</span>
+          <input type="text" id="new-project-name" placeholder="如：Lotus 项目" />
+        </label>
+        <label>
+          <span>工作目录</span>
+          <input type="text" id="new-project-cwd" placeholder="如：~/ZCodeProject/lotus" />
+        </label>
+      </div>
+      <div class="modal-footer">
+        <button class="footer-btn secondary" id="new-project-cancel" type="button">取消</button>
+        <button class="footer-btn primary" id="new-project-create" type="button">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 重命名对话框（项目 / 标签等复用） -->
+  <div id="rename-modal" class="modal hidden">
+    <div class="modal-overlay"></div>
+    <div class="modal-content">
+      <h2 id="rename-modal-title">重命名</h2>
+      <div class="modal-form">
+        <label>
+          <span id="rename-modal-label">名称</span>
+          <input type="text" id="rename-modal-input" placeholder="输入新名称" />
+        </label>
+      </div>
+      <div class="modal-footer">
+        <button class="footer-btn secondary" id="rename-modal-cancel" type="button">取消</button>
+        <button class="footer-btn primary" id="rename-modal-confirm" type="button">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 自定义右键菜单（OTTY 风格） -->
+  <div id="ctx-menu" class="ctx-menu hidden" role="menu"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Lotus">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#2a2438"/>
+      <stop offset="100%" stop-color="#1a1624"/>
+    </linearGradient>
+    <linearGradient id="petal" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0%" stop-color="#f0a8bc"/>
+      <stop offset="100%" stop-color="#e88da7"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <!-- petals -->
+  <g fill="url(#petal)">
+    <ellipse cx="64" cy="48" rx="16" ry="34" transform="rotate(0 64 70)"/>
+    <ellipse cx="64" cy="48" rx="16" ry="34" transform="rotate(40 64 70)"/>
+    <ellipse cx="64" cy="48" rx="16" ry="34" transform="rotate(-40 64 70)"/>
+    <ellipse cx="64" cy="48" rx="16" ry="34" transform="rotate(80 64 70)"/>
+    <ellipse cx="64" cy="48" rx="16" ry="34" transform="rotate(-80 64 70)"/>
+    <ellipse cx="64" cy="52" rx="18" ry="30" transform="rotate(20 64 72)"/>
+    <ellipse cx="64" cy="52" rx="18" ry="30" transform="rotate(-20 64 72)"/>
+  </g>
+  <circle cx="64" cy="78" r="10" fill="#f7c9d6"/>
+  <ellipse cx="64" cy="96" rx="28" ry="8" fill="#3d3450" opacity="0.55"/>
+</svg>

@@ -1,0 +1,33 @@
+[package]
+name = "lotus"
+version = "0.2.0"
+edition = "2024"
+description = "Lotus 🪷 — an OTTY-style native terminal for Linux"
+license = "MIT"
+
+[[bin]]
+name = "lotus"
+path = "src/main.rs"
+
+[dependencies]
+# GTK + WebKitGTK（直接用，和 yelp 同路径，绕过 wry/tao 的 X11 foreign window 白屏问题）
+gtk = "0.18"
+webkit2gtk = { version = "2.0", features = ["v2_6", "v2_38", "v2_40"] }
+# PTY 处理（复用现有逻辑）
+portable-pty = "0.9"
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+base64 = "0.22"
+# 错误处理 + 日志
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+# release 极致优化
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
