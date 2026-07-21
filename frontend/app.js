@@ -626,8 +626,8 @@ function bindUIEvents() {
     } catch (e) { console.error('[lotus] 绑定', id, '失败:', e); }
   };
   bind('btn-close', 'click', () => sendToBackend({ type: 'quit' }));
-  bind('btn-min', 'click', () => {});
-  bind('btn-max', 'click', () => {});
+  bind('btn-min', 'click', () => sendToBackend({ type: 'window_minimize' }));
+  bind('btn-max', 'click', () => sendToBackend({ type: 'window_toggle_maximize' }));
   bind('new-tab-btn', 'click', newTab);
 
   // 侧边栏导航：根据 data-view 切换视图

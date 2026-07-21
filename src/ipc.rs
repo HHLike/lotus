@@ -82,6 +82,12 @@ pub enum ClientMessage {
     /// 退出应用
     #[serde(rename = "quit")]
     Quit,
+    /// 最小化无边框窗口
+    #[serde(rename = "window_minimize")]
+    WindowMinimize,
+    /// 在最大化和还原之间切换
+    #[serde(rename = "window_toggle_maximize")]
+    WindowToggleMaximize,
     /// 打开 devtools
     #[serde(rename = "devtools")]
     Devtools,
@@ -296,4 +302,20 @@ pub fn encode_b64(bytes: &[u8]) -> String {
 pub fn decode_b64(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientMessage;
+
+    #[test]
+    fn parses_frameless_window_controls() {
+        let minimize: ClientMessage =
+            serde_json::from_str(r#"{"type":"window_minimize"}"#).unwrap();
+        assert!(matches!(minimize, ClientMessage::WindowMinimize));
+
+        let maximize: ClientMessage =
+            serde_json::from_str(r#"{"type":"window_toggle_maximize"}"#).unwrap();
+        assert!(matches!(maximize, ClientMessage::WindowToggleMaximize));
+    }
 }

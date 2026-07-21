@@ -68,7 +68,104 @@ struct AppState {
     running_cmds: HashMap<u32, (String, Instant)>,
 }
 
+const FRAME_RESIZE_MARGIN: f64 = 6.0;
+const TITLE_BAR_HEIGHT: f64 = 36.0;
+const TITLE_CONTROLS_WIDTH: f64 = 104.0;
+const DRAG_THRESHOLD: f64 = 4.0;
+
+#[derive(Debug, Clone, Copy)]
+struct PendingDrag {
+    local_x: f64,
+    local_y: f64,
+    root_x: i32,
+    root_y: i32,
+    time: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameHit {
+    Resize(gtk::gdk::WindowEdge),
+    Drag,
+    Client,
+}
+
+fn frame_hit(x: f64, y: f64, width: f64, height: f64, maximized: bool) -> FrameHit {
+    if !maximized {
+        let left = x < FRAME_RESIZE_MARGIN;
+        let right = x >= width - FRAME_RESIZE_MARGIN;
+        let top = y < FRAME_RESIZE_MARGIN;
+        let bottom = y >= height - FRAME_RESIZE_MARGIN;
+
+        let edge = match (left, right, top, bottom) {
+            (true, _, true, _) => Some(gtk::gdk::WindowEdge::NorthWest),
+            (_, true, true, _) => Some(gtk::gdk::WindowEdge::NorthEast),
+            (true, _, _, true) => Some(gtk::gdk::WindowEdge::SouthWest),
+            (_, true, _, true) => Some(gtk::gdk::WindowEdge::SouthEast),
+            (_, _, true, _) => Some(gtk::gdk::WindowEdge::North),
+            (_, _, _, true) => Some(gtk::gdk::WindowEdge::South),
+            (true, _, _, _) => Some(gtk::gdk::WindowEdge::West),
+            (_, true, _, _) => Some(gtk::gdk::WindowEdge::East),
+            _ => None,
+        };
+        if let Some(edge) = edge {
+            return FrameHit::Resize(edge);
+        }
+    }
+
+    let controls_start = (width - TITLE_CONTROLS_WIDTH).max(0.0);
+    if y < TITLE_BAR_HEIGHT && x < controls_start {
+        FrameHit::Drag
+    } else {
+        FrameHit::Client
+    }
+}
+
+fn drag_threshold_exceeded(start_x: f64, start_y: f64, x: f64, y: f64) -> bool {
+    let delta_x = x - start_x;
+    let delta_y = y - start_y;
+    delta_x * delta_x + delta_y * delta_y >= DRAG_THRESHOLD * DRAG_THRESHOLD
+}
+
+fn preferred_gdk_backend(
+    explicit_backend_is_set: bool,
+    session_type: Option<&str>,
+    desktop: Option<&str>,
+    display: Option<&str>,
+) -> Option<&'static str> {
+    let is_wayland = session_type.is_some_and(|value| value.eq_ignore_ascii_case("wayland"));
+    let is_ukui = desktop.is_some_and(|value| {
+        value
+            .split(':')
+            .any(|part| part.eq_ignore_ascii_case("ukui"))
+    });
+    let x11_is_available = display.is_some_and(|value| !value.trim().is_empty());
+
+    if !explicit_backend_is_set && is_wayland && is_ukui && x11_is_available {
+        Some("x11")
+    } else {
+        None
+    }
+}
+
+fn configure_gdk_backend() {
+    let explicit_backend_is_set = std::env::var_os("GDK_BACKEND").is_some();
+    let session_type = std::env::var("XDG_SESSION_TYPE").ok();
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").ok();
+    let display = std::env::var("DISPLAY").ok();
+    if let Some(backend) = preferred_gdk_backend(
+        explicit_backend_is_set,
+        session_type.as_deref(),
+        desktop.as_deref(),
+        display.as_deref(),
+    ) {
+        // SAFETY: main() invokes this before GTK, logging, or any worker thread starts.
+        unsafe { std::env::set_var("GDK_BACKEND", backend) };
+    }
+}
+
 fn main() -> Result<()> {
+    configure_gdk_backend();
+
     // 初始化日志
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
@@ -149,6 +246,8 @@ fn main() -> Result<()> {
     // ====== 创建 GTK 窗口 ======
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
     window.set_title("Lotus 🪷");
+    // 前端已经提供自绘标题栏，关闭窗口管理器的原生装饰以避免双标题栏。
+    window.set_decorated(false);
     window.set_default_size(1100, 720);
     window.connect_destroy(|_| {
         info!("窗口关闭，退出 GTK 主循环");
@@ -166,12 +265,13 @@ fn main() -> Result<()> {
     // 注册 IPC：JS 调用 window.webkit.messageHandlers.ipc.postMessage(msg) → 触发回调
     // 我们注入一个 window.ipc.postMessage 桥，让前端代码和 wry 版本兼容
     let state_for_ipc = state.clone();
+    let window_for_ipc = window.clone();
     content_manager.register_script_message_handler("ipc");
     content_manager.connect_script_message_received(None, move |_m, msg: &JavascriptResult| {
         // 提取 JS 传来的字符串
         if let Some(js_value) = msg.js_value() {
             let body = js_value.to_string();
-            handle_client_message(&body, &state_for_ipc);
+            handle_client_message(&body, &state_for_ipc, &window_for_ipc);
         }
     });
 
@@ -192,6 +292,116 @@ fn main() -> Result<()> {
     // 屏蔽 WebKit 默认右键菜单（后退/刷新/检查元素等与应用无关的项）
     // 返回 true = 已处理，不展示原生菜单；前端用自定义 context menu 替代
     webview.connect_context_menu(|_wv, _menu, _event, _hit| true);
+
+    // 无边框窗口的原生拖动/缩放。直接使用 GDK 事件的 root 坐标与时间戳，
+    // 避免 DOM screenX/screenY 在 HiDPI、多屏和不同后端下发生坐标偏差。
+    webview.add_events(
+        gtk::gdk::EventMask::BUTTON_PRESS_MASK
+            | gtk::gdk::EventMask::BUTTON_RELEASE_MASK
+            | gtk::gdk::EventMask::POINTER_MOTION_MASK,
+    );
+    let pending_drag = std::rc::Rc::new(std::cell::RefCell::new(None::<PendingDrag>));
+    let consume_release = std::rc::Rc::new(std::cell::Cell::new(false));
+    let window_for_frame = window.clone();
+    let pending_drag_for_press = pending_drag.clone();
+    let consume_release_for_press = consume_release.clone();
+    webview.connect_button_press_event(move |widget, event| {
+        if event.button() != 1 {
+            return gtk::glib::Propagation::Proceed;
+        }
+
+        let (x, y) = event.position();
+        let (root_x, root_y) = event.root();
+        let allocation = widget.allocation();
+        let hit = frame_hit(
+            x,
+            y,
+            allocation.width() as f64,
+            allocation.height() as f64,
+            window_for_frame.is_maximized(),
+        );
+
+        match hit {
+            FrameHit::Resize(edge) => {
+                consume_release_for_press.set(true);
+                pending_drag_for_press.borrow_mut().take();
+                window_for_frame.begin_resize_drag(
+                    edge,
+                    event.button() as i32,
+                    root_x.round() as i32,
+                    root_y.round() as i32,
+                    event.time(),
+                );
+                gtk::glib::Propagation::Stop
+            }
+            FrameHit::Drag => {
+                consume_release_for_press.set(true);
+                if event.event_type() == gtk::gdk::EventType::DoubleButtonPress {
+                    pending_drag_for_press.borrow_mut().take();
+                    if window_for_frame.is_maximized() {
+                        window_for_frame.unmaximize();
+                    } else {
+                        window_for_frame.maximize();
+                    }
+                } else {
+                    pending_drag_for_press.replace(Some(PendingDrag {
+                        local_x: x,
+                        local_y: y,
+                        root_x: root_x.round() as i32,
+                        root_y: root_y.round() as i32,
+                        time: event.time(),
+                    }));
+                }
+                gtk::glib::Propagation::Stop
+            }
+            FrameHit::Client => {
+                consume_release_for_press.set(false);
+                pending_drag_for_press.borrow_mut().take();
+                gtk::glib::Propagation::Proceed
+            }
+        }
+    });
+
+    let window_for_motion = window.clone();
+    let pending_drag_for_motion = pending_drag.clone();
+    webview.connect_motion_notify_event(move |_widget, event| {
+        if !event
+            .state()
+            .contains(gtk::gdk::ModifierType::BUTTON1_MASK)
+        {
+            pending_drag_for_motion.borrow_mut().take();
+            return gtk::glib::Propagation::Proceed;
+        }
+
+        let (x, y) = event.position();
+        let should_start = pending_drag_for_motion
+            .borrow()
+            .as_ref()
+            .map(|pending| drag_threshold_exceeded(pending.local_x, pending.local_y, x, y))
+            .unwrap_or(false);
+        if !should_start {
+            return gtk::glib::Propagation::Proceed;
+        }
+
+        if let Some(pending) = pending_drag_for_motion.borrow_mut().take() {
+            window_for_motion.begin_move_drag(
+                1,
+                pending.root_x,
+                pending.root_y,
+                pending.time,
+            );
+        }
+        gtk::glib::Propagation::Stop
+    });
+
+    webview.connect_button_release_event(move |_widget, event| {
+        if event.button() == 1 && consume_release.replace(false) {
+            pending_drag.borrow_mut().take();
+            gtk::glib::Propagation::Stop
+        } else {
+            gtk::glib::Propagation::Proceed
+        }
+    });
 
     vbox.pack_start(&webview, true, true, 0);
 
@@ -390,7 +600,7 @@ fn main() -> Result<()> {
 }
 
 /// 处理前端发来的消息（JS → Rust）
-fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>) {
+fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk::Window) {
     let msg: ClientMessage = match serde_json::from_str(body) {
         Ok(m) => m,
         Err(e) => {
@@ -398,6 +608,22 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>) {
             return;
         }
     };
+
+    match &msg {
+        ClientMessage::WindowMinimize => {
+            window.iconify();
+            return;
+        }
+        ClientMessage::WindowToggleMaximize => {
+            if window.is_maximized() {
+                window.unmaximize();
+            } else {
+                window.maximize();
+            }
+            return;
+        }
+        _ => {}
+    }
 
     let mut s = state.lock().unwrap();
     match msg {
@@ -469,6 +695,7 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>) {
                 }
             }
         }
+        ClientMessage::WindowMinimize | ClientMessage::WindowToggleMaximize => unreachable!(),
         // ===== 设置相关 =====
         ClientMessage::Devtools => {
             info!("请求打开 devtools");
@@ -1128,5 +1355,94 @@ fn theme_to_payload(theme: &Theme) -> ThemePayload {
         sidebar_bg: rgb_to_css(theme.sidebar_bg),
         tab_bg: rgb_to_css(theme.tab_bg),
         is_dark: theme.is_dark,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FrameHit, drag_threshold_exceeded, frame_hit, preferred_gdk_backend};
+    use gtk::gdk::WindowEdge;
+
+    #[test]
+    fn ukui_wayland_prefers_x11_for_frameless_window() {
+        assert_eq!(
+            preferred_gdk_backend(false, Some("wayland"), Some("UKUI"), Some(":0")),
+            Some("x11")
+        );
+    }
+
+    #[test]
+    fn explicit_gdk_backend_is_preserved() {
+        assert_eq!(
+            preferred_gdk_backend(true, Some("wayland"), Some("UKUI"), Some(":0")),
+            None
+        );
+    }
+
+    #[test]
+    fn x11_is_not_forced_outside_ukui_wayland_with_display() {
+        let unsupported_environments = [
+            (Some("x11"), Some("UKUI"), Some(":0")),
+            (Some("wayland"), Some("GNOME"), Some(":0")),
+            (Some("wayland"), Some("UKUI"), None),
+            (Some("wayland"), Some("UKUI"), Some("")),
+        ];
+
+        for (session_type, desktop, display) in unsupported_environments {
+            assert_eq!(
+                preferred_gdk_backend(false, session_type, desktop, display),
+                None
+            );
+        }
+
+        assert_eq!(
+            preferred_gdk_backend(
+                false,
+                Some("wayland"),
+                Some("GNOME:UKUI"),
+                Some(":0")
+            ),
+            Some("x11")
+        );
+    }
+
+    #[test]
+    fn frame_hit_detects_resize_edges_and_corners() {
+        assert_eq!(
+            frame_hit(1.0, 1.0, 1100.0, 720.0, false),
+            FrameHit::Resize(WindowEdge::NorthWest)
+        );
+        assert_eq!(
+            frame_hit(550.0, 1.0, 1100.0, 720.0, false),
+            FrameHit::Resize(WindowEdge::North)
+        );
+        assert_eq!(
+            frame_hit(1099.0, 719.0, 1100.0, 720.0, false),
+            FrameHit::Resize(WindowEdge::SouthEast)
+        );
+        assert_eq!(
+            frame_hit(1.0, 360.0, 1100.0, 720.0, false),
+            FrameHit::Resize(WindowEdge::West)
+        );
+    }
+
+    #[test]
+    fn frame_hit_reserves_title_controls_and_supports_maximized_drag() {
+        assert_eq!(frame_hit(200.0, 18.0, 1100.0, 720.0, false), FrameHit::Drag);
+        assert_eq!(
+            frame_hit(1050.0, 18.0, 1100.0, 720.0, false),
+            FrameHit::Client
+        );
+        assert_eq!(frame_hit(550.0, 1.0, 1100.0, 720.0, true), FrameHit::Drag);
+        assert_eq!(
+            frame_hit(550.0, 200.0, 1100.0, 720.0, false),
+            FrameHit::Client
+        );
+    }
+
+    #[test]
+    fn drag_requires_pointer_motion_past_threshold() {
+        assert!(!drag_threshold_exceeded(10.0, 10.0, 13.0, 12.0));
+        assert!(drag_threshold_exceeded(10.0, 10.0, 14.0, 10.0));
     }
 }
