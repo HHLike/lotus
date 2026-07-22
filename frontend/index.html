@@ -85,7 +85,7 @@
         <button class="footer-btn secondary" id="refresh-agents-btn" type="button">刷新探测</button>
       </div>
       <div class="agents-intro">
-        一键在新标签启动编码 Agent CLI。Lotus 会跟踪命令状态、显示 tab 徽章，并在长任务完成时通知你。
+        一键在新标签启动编码 Agent CLI。Lotus 会跟踪命令状态，并按设置发送单轮完成通知；后台进程结束沿用安静通知策略。
       </div>
       <div class="list-body" id="agents-list">
         <div class="empty-state">正在探测本机 Agent…</div>
@@ -283,6 +283,7 @@
   <!-- 自定义右键菜单（OTTY 风格） -->
   <div id="ctx-menu" class="ctx-menu hidden" role="menu"></div>
 
+  <script src="agent-policy.js"></script>
   <script src="notification-settings.js"></script>
   <script src="terminal-output.js"></script>
   <script src="app.js"></script>
