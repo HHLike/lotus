@@ -67,6 +67,18 @@ PROMPT_COMMAND="__lotus_prompt; ${PROMPT_COMMAND:-}"
 "#
 }
 
+/// Pi 常驻会话的单次 Agent 工作开始/完成信号。
+pub fn pi_notification_extension() -> &'static str {
+    r#"export default function (pi) {
+  const active = () => process.stdout.write("\x1b]9;4;3\x07");
+  const clear = () => process.stdout.write("\x1b]9;4;0;\x07");
+
+  pi.on("agent_start", active);
+  pi.on("agent_settled", clear);
+}
+"#
+}
+
 /// 把集成脚本写到 ~/.local/share/lotus/shell-integration.bash（幂等）
 pub fn install() -> Result<PathBuf> {
     let dir = data_dir().context("无法确定数据目录（$HOME 未设置）")?;
@@ -74,6 +86,16 @@ pub fn install() -> Result<PathBuf> {
     let path = dir.join("shell-integration.bash");
     // 幂等：每次启动都覆盖，确保脚本是最新的（用户不会手动改这个文件）
     std::fs::write(&path, integration_script())
+        .with_context(|| format!("写入 {} 失败", path.display()))?;
+    Ok(path)
+}
+
+/// 写入由 Lotus 启动 Pi 时显式加载的通知扩展。
+pub fn install_pi_notification_extension() -> Result<PathBuf> {
+    let dir = data_dir().context("无法确定数据目录（$HOME 未设置）")?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("创建 {} 失败", dir.display()))?;
+    let path = dir.join("pi-notification-extension.js");
+    std::fs::write(&path, pi_notification_extension())
         .with_context(|| format!("写入 {} 失败", path.display()))?;
     Ok(path)
 }
@@ -98,11 +120,27 @@ pub struct CommandInfo {
 pub enum CommandEvent {
     Start,
     End,
+    AgentStart,
+    AgentEnd,
 }
 
 /// 解析单个 OSC 9 payload（JSON 部分），失败返回 None
 pub fn parse_osc9_payload(payload: &[u8]) -> Option<CommandInfo> {
     let text = std::str::from_utf8(payload).ok()?;
+
+    let progress_event = match text.trim_end_matches(';') {
+        "4;3" => Some(CommandEvent::AgentStart),
+        "4;0" => Some(CommandEvent::AgentEnd),
+        _ => None,
+    };
+    if let Some(event) = progress_event {
+        return Some(CommandInfo {
+            event,
+            cmd: String::new(),
+            cwd: String::new(),
+            code: 0,
+        });
+    }
 
     #[derive(serde::Deserialize)]
     struct Osc9Payload {
@@ -126,4 +164,29 @@ pub fn parse_osc9_payload(payload: &[u8]) -> Option<CommandInfo> {
         cwd: p.cwd,
         code: p.code,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_osc9_payload, pi_notification_extension, CommandEvent};
+
+    #[test]
+    fn parses_standard_terminal_progress_as_agent_lifecycle() {
+        let started = parse_osc9_payload(b"4;3").unwrap();
+        let finished = parse_osc9_payload(b"4;0;").unwrap();
+
+        assert_eq!(started.event, CommandEvent::AgentStart);
+        assert_eq!(finished.event, CommandEvent::AgentEnd);
+    }
+
+    #[test]
+    fn pi_extension_emits_progress_for_complete_agent_turns() {
+        let script = pi_notification_extension();
+
+        assert!(script.contains("agent_start"));
+        assert!(script.contains("agent_settled"));
+        assert!(!script.contains("session_shutdown"));
+        assert!(script.contains("\\x1b]9;4;3\\x07"));
+        assert!(script.contains("\\x1b]9;4;0;\\x07"));
+    }
 }

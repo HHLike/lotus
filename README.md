@@ -51,7 +51,7 @@ Lotus 是独立的 **GUI 终端应用**（不是 TUI）。设计语言参考 [Ot
 ### Agent 友好
 - **Agents 面板**：探测本机 `claude` / `codex` / `opencode` / `pi` / `aider` 等，一键新标签启动
 - **Tab 徽章**：运行中 / 成功 / 失败状态
-- **完成通知**：仅后台运行至少 10 秒的任务结束时发送桌面通知（`notify-send`）
+- **完成通知**：Agent CLI 单轮任务与普通命令通知可分别开关；后台 Agent 进程结束遵循安静通知策略（`notify-send`）
 - 不抢占 Agent 自带输入框（Pi / Claude 等 TUI 全屏使用）
 
 ### 交互
@@ -59,6 +59,7 @@ Lotus 是独立的 **GUI 终端应用**（不是 TUI）。设计语言参考 [Ot
 - `Ctrl+C` 复制 · `Ctrl+V` 粘贴 · `Ctrl+Z` 中断（SIGINT）
 - 剪贴板走 GTK 系统剪贴板（WebKit 自定义协议下更可靠）
 - 设置面板：主题、字体、字号、透明度、默认 Shell
+- 通知设置：Agent CLI 完成通知默认开启，普通命令完成通知默认关闭
 
 ---
 
@@ -171,6 +172,8 @@ shell = "/bin/bash"          # 可选，默认 $SHELL
 font = "JetBrains Mono"
 font_size = 14
 opacity = 1.0
+agent_notifications_enabled = true
+command_notifications_enabled = false
 ```
 
 数据目录：`~/.local/share/lotus/`（项目、历史、书签、shell integration 脚本）

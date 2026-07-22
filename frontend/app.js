@@ -64,7 +64,7 @@ let _currentProjectId = null;
 // app.js 只需注册 _handle（实际处理函数），队列里的消息会自动冲刷
 window.__lotus = window.__lotus || { _queue: [], _ready: false };
 window.__lotus._handle = (msg) => {
-  console.log('[lotus] ← backend:', msg);
+  if (shouldLogIpcMessage(msg)) console.log('[lotus] ← backend:', msg);
   try {
     handleServerMessage(msg);
   } catch (e) {
@@ -84,7 +84,7 @@ setTimeout(() => {
 // 发送消息给 Rust 后端
 function sendToBackend(msg) {
   const json = JSON.stringify(msg);
-  console.log('[lotus] → backend:', json.substring(0, 80));
+  if (shouldLogIpcMessage(msg)) console.log('[lotus] → backend:', json.substring(0, 80));
   window.ipc.postMessage(json);
 }
 
@@ -739,11 +739,23 @@ function handleServerMessage(msg) {
   switch (msg.type) {
     case 'output': {
       const t = terminals.get(msg.tab_id);
+      const acknowledge = () => {
+        sendToBackend({ type: 'output_ack', tab_id: msg.tab_id, seq: msg.seq });
+      };
       if (t) {
-        // base64 → 字符串 → 写入 xterm
-        const bytes = atob(msg.data);
-        const decoded = decodeURIComponent(escape(bytes));
-        t.term.write(decoded);
+        try {
+          // 保持 PTY 原始字节；xterm 的流式 UTF-8 解码器能正确拼接跨 chunk 字符。
+          // write 回调在该 chunk 解析完成后触发，用作后端背压 ACK。
+          writeTerminalOutput(t.term, msg.data, acknowledge);
+        } catch (e) {
+          console.error('[lotus] 终端输出写入失败:', e);
+          // 不能伪造 ACK，否则会永久丢失该块并破坏后续 ANSI/UTF-8 状态。
+          // 保持流控暂停，用户可关闭该 tab；同时把错误明确显示出来。
+          showErrorOverlay('终端输出解析失败，已暂停该标签页以避免显示损坏：\n' + e.message);
+        }
+      } else {
+        // tab 可能在消息到达前已关闭；仍 ACK，让后端清理竞态中的在途块。
+        acknowledge();
       }
       break;
     }
@@ -923,7 +935,15 @@ let _projectsCache = [];
 
 // ====== 设置面板辅助函数 ======
 // 当前配置缓存（由 config 消息填充，供其他逻辑查询）
-let _currentConfig = { theme: 'lotus', shell: '', font: 'JetBrains Mono', font_size: 14, opacity: 1.0 };
+let _currentConfig = {
+  theme: 'lotus',
+  shell: '',
+  font: 'JetBrains Mono',
+  font_size: 14,
+  opacity: 1.0,
+  agent_notifications_enabled: true,
+  command_notifications_enabled: false,
+};
 function getCurrentConfig() { return _currentConfig; }
 
 // 填充 select 下拉框
@@ -948,7 +968,11 @@ function fillSelect(id, options, selected, includeEmpty) {
 
 // 用配置数据填充设置表单
 function fillSettingsForm(cfg) {
-  _currentConfig = cfg;
+  _currentConfig = {
+    ...cfg,
+    agent_notifications_enabled: cfg.agent_notifications_enabled !== false,
+    command_notifications_enabled: cfg.command_notifications_enabled === true,
+  };
   const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
   setVal('setting-theme', cfg.theme);
   setVal('setting-font', cfg.font);
@@ -956,6 +980,14 @@ function fillSettingsForm(cfg) {
   setVal('setting-shell', cfg.shell);
   const opacityEl = document.getElementById('setting-opacity');
   if (opacityEl) opacityEl.value = Math.round(cfg.opacity * 100);
+  const agentNotificationsEl = document.getElementById('setting-agent-notifications-enabled');
+  if (agentNotificationsEl) {
+    agentNotificationsEl.checked = _currentConfig.agent_notifications_enabled;
+  }
+  const commandNotificationsEl = document.getElementById('setting-command-notifications-enabled');
+  if (commandNotificationsEl) {
+    commandNotificationsEl.checked = _currentConfig.command_notifications_enabled;
+  }
   updateOpacityDisplay();
   updateFontPreview();
 }
@@ -1375,6 +1407,19 @@ function setupSettingsPanel() {
     updateFontPreview();
   });
 
+  bind('setting-agent-notifications-enabled', 'change', (e) => {
+    _currentConfig.agent_notifications_enabled = e.target.checked;
+    showStatus(e.target.checked
+      ? 'Agent CLI 完成通知已开启（点保存以持久化）'
+      : 'Agent CLI 完成通知已关闭（点保存以持久化）');
+  });
+  bind('setting-command-notifications-enabled', 'change', (e) => {
+    _currentConfig.command_notifications_enabled = e.target.checked;
+    showStatus(e.target.checked
+      ? '普通命令完成通知已开启（点保存以持久化）'
+      : '普通命令完成通知已关闭（点保存以持久化）');
+  });
+
   // 保存按钮
   bind('save-btn', 'click', () => {
     const config = collectFormConfig();
@@ -1383,7 +1428,15 @@ function setupSettingsPanel() {
 
   // 重置按钮
   bind('reset-btn', 'click', () => {
-    const defaults = { theme: 'lotus', shell: '', font: 'JetBrains Mono', font_size: 14, opacity: 1.0 };
+    const defaults = {
+      theme: 'lotus',
+      shell: '',
+      font: 'JetBrains Mono',
+      font_size: 14,
+      opacity: 1.0,
+      agent_notifications_enabled: true,
+      command_notifications_enabled: false,
+    };
     fillSettingsForm(defaults);
     sendToBackend({ type: 'set_theme', name: 'lotus' });
     applyOpacityPreview();
@@ -1445,12 +1498,16 @@ function updateFontPreview() {
 function collectFormConfig() {
   const getVal = (id) => { const el = document.getElementById(id); return el ? el.value : ''; };
   const opacityEl = document.getElementById('setting-opacity');
+  const agentNotificationsEl = document.getElementById('setting-agent-notifications-enabled');
+  const commandNotificationsEl = document.getElementById('setting-command-notifications-enabled');
   return {
     theme: getVal('setting-theme') || 'lotus',
     shell: getVal('setting-shell') || '',
     font: getVal('setting-font') || 'JetBrains Mono',
     font_size: parseInt(getVal('setting-font-size')) || 14,
     opacity: opacityEl ? parseInt(opacityEl.value) / 100 : 1.0,
+    agent_notifications_enabled: agentNotificationsEl ? agentNotificationsEl.checked : true,
+    command_notifications_enabled: commandNotificationsEl ? commandNotificationsEl.checked : false,
   };
 }
 
@@ -2385,14 +2442,17 @@ function onCommandFinished(tabId, cmd, code, durationMs) {
     (durationMs ? ` (${Math.round(durationMs / 100) / 10}s)` : '');
   setTabBadge(tabId, disposition.badge, disposition.badge ? badgeTitle : '');
 
-  if (disposition.notify) {
-    const isAgent = finished.wasAgent || isAgentCommand(cmd);
+  const isAgent = finished.wasAgent || isAgentCommand(cmd);
+  const notificationKind = isAgent ? 'agent' : 'command';
+  if (NotificationSettings.shouldSend(_currentConfig, notificationKind, disposition.notify)) {
     const status = ok ? '完成' : '失败';
     const short = String(cmd || '').replace(/\n/g, ' ').slice(0, 60);
     sendToBackend({
       type: 'desktop_notify',
+      kind: notificationKind,
+      tab_id: tabId,
       title: isAgent ? `Agent ${status}` : `命令${status}`,
-      body: short + ` · ${(durationMs / 1000).toFixed(1)}s`,
+      body: short + (durationMs ? ` · ${(durationMs / 1000).toFixed(1)}s` : ''),
     });
   }
 }

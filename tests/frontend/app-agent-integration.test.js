@@ -23,6 +23,13 @@ test('app delegates lifecycle and completion decisions to AgentPolicy', () => {
   assert.match(app, /AgentPolicy\.completionDisposition\(/);
 });
 
+test('completion policy is combined with the matching notification switch', () => {
+  assert.match(
+    app,
+    /NotificationSettings\.shouldSend\(_currentConfig, notificationKind, disposition\.notify\)/
+  );
+});
+
 test('tab titles do not create sticky agent state', () => {
   assert.doesNotMatch(app, /isAgent:\s*isAgentCommand\(title\)/);
   assert.doesNotMatch(app, /isAgentCommand\(msg\.title\)/);

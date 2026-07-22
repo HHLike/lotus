@@ -85,7 +85,7 @@
         <button class="footer-btn secondary" id="refresh-agents-btn" type="button">刷新探测</button>
       </div>
       <div class="agents-intro">
-        一键在新标签启动编码 Agent CLI。Lotus 会跟踪命令状态，并在后台任务运行至少 10 秒后完成时通知你。
+        一键在新标签启动编码 Agent CLI。Lotus 会跟踪命令状态，并按设置发送单轮完成通知；后台进程结束沿用安静通知策略。
       </div>
       <div class="list-body" id="agents-list">
         <div class="empty-state">正在探测本机 Agent…</div>
@@ -162,6 +162,33 @@
             <div class="row-control">
               <select id="setting-shell"></select>
               <span class="row-hint">仅对新标签页生效</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- ===== 通知分区 ===== -->
+        <section class="settings-section">
+          <h2 class="section-title">通知</h2>
+
+          <div class="settings-row">
+            <label class="row-label" for="setting-agent-notifications-enabled">Agent CLI 执行完毕</label>
+            <div class="row-control">
+              <label class="toggle-switch" for="setting-agent-notifications-enabled">
+                <input type="checkbox" id="setting-agent-notifications-enabled" checked />
+                <span class="toggle-track" aria-hidden="true"></span>
+              </label>
+              <span class="row-hint">Agent CLI 完成或失败时发送桌面通知</span>
+            </div>
+          </div>
+
+          <div class="settings-row">
+            <label class="row-label" for="setting-command-notifications-enabled">普通命令执行完毕</label>
+            <div class="row-control">
+              <label class="toggle-switch" for="setting-command-notifications-enabled">
+                <input type="checkbox" id="setting-command-notifications-enabled" />
+                <span class="toggle-track" aria-hidden="true"></span>
+              </label>
+              <span class="row-hint">普通命令完成或失败时发送桌面通知</span>
             </div>
           </div>
         </section>
@@ -257,6 +284,8 @@
   <div id="ctx-menu" class="ctx-menu hidden" role="menu"></div>
 
   <script src="agent-policy.js"></script>
+  <script src="notification-settings.js"></script>
+  <script src="terminal-output.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

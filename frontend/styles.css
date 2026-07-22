@@ -293,7 +293,6 @@ body {
   position: absolute;
   top: 0; left: 0; right: 0; bottom: 0;
   display: none;
-  padding: 4px; /* 统一 padding，避免和 .xterm 叠加 */
 }
 .terminal-pane.active { display: block; }
 
@@ -328,7 +327,7 @@ body {
 /* ============ xterm.js 样式覆盖 ============ */
 .xterm {
   height: 100%;
-  padding: 0; /* 不要给 .xterm 加 padding，会干扰字符宽度计算 */
+  padding: 4px; /* FitAddon 会扣除此留白，避免最底行超出可见区域 */
 }
 .xterm-viewport { background-color: transparent !important; }
 .xterm-screen { background-color: transparent !important; }
@@ -447,6 +446,49 @@ select {
 select option {
   background: var(--sidebar-bg);
   color: var(--fg);
+}
+
+/* 设置页开关 */
+.toggle-switch {
+  position: relative;
+  display: inline-flex;
+  width: 42px;
+  height: 24px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.toggle-switch input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.toggle-track {
+  width: 100%;
+  height: 100%;
+  border-radius: 12px;
+  background: var(--block-border);
+  transition: background 0.15s;
+}
+.toggle-track::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--fg);
+  transition: transform 0.15s;
+}
+.toggle-switch input:checked + .toggle-track {
+  background: var(--accent);
+}
+.toggle-switch input:checked + .toggle-track::after {
+  transform: translateX(18px);
+}
+.toggle-switch input:focus-visible + .toggle-track {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* range 滑块 */
