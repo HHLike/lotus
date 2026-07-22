@@ -19,6 +19,24 @@ pub struct ConfigPayload {
     pub font: String,
     pub font_size: u16,
     pub opacity: f32,
+    #[serde(default = "default_true", alias = "notifications_enabled")]
+    pub agent_notifications_enabled: bool,
+    #[serde(default)]
+    pub command_notifications_enabled: bool,
+}
+
+/// 桌面通知类别，用于应用对应的用户偏好。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationKind {
+    Agent,
+    Command,
+}
+
+impl Default for NotificationKind {
+    fn default() -> Self {
+        Self::Command
+    }
 }
 
 /// 历史记录载荷（给前端展示用）
@@ -80,6 +98,9 @@ pub enum ClientMessage {
     /// 终端尺寸变化
     #[serde(rename = "resize")]
     Resize { tab_id: u32, cols: u16, rows: u16 },
+    /// xterm.js 已完成一个输出块的解析，可继续发送该 tab 的下一块
+    #[serde(rename = "output_ack")]
+    OutputAck { tab_id: u32, seq: u64 },
     /// 应用启动完成通知
     #[serde(rename = "ready")]
     Ready,
@@ -175,6 +196,10 @@ pub enum ClientMessage {
     /// 桌面通知（前端在命令完成/需要关注时请求）
     #[serde(rename = "desktop_notify")]
     DesktopNotify {
+        #[serde(default)]
+        kind: NotificationKind,
+        #[serde(default)]
+        tab_id: Option<u32>,
         title: String,
         body: String,
     },
@@ -186,7 +211,11 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     /// PTY 输出（base64 编码的字节）
     #[serde(rename = "output")]
-    Output { tab_id: u32, data: String },
+    Output {
+        tab_id: u32,
+        seq: u64,
+        data: String,
+    },
     /// tab 已创建
     #[serde(rename = "tab_created")]
     TabCreated {
@@ -313,7 +342,7 @@ pub fn decode_b64(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::ClientMessage;
+    use super::{ClientMessage, NotificationKind};
 
     #[test]
     fn parses_frameless_window_controls() {
@@ -324,5 +353,60 @@ mod tests {
         let maximize: ClientMessage =
             serde_json::from_str(r#"{"type":"window_toggle_maximize"}"#).unwrap();
         assert!(matches!(maximize, ClientMessage::WindowToggleMaximize));
+    }
+
+    #[test]
+    fn parses_terminal_output_acknowledgement() {
+        let parsed = serde_json::from_str::<ClientMessage>(
+            r#"{"type":"output_ack","tab_id":7,"seq":3}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            parsed,
+            ClientMessage::OutputAck { tab_id: 7, seq: 3 }
+        ));
+    }
+
+    #[test]
+    fn parses_desktop_notification_kind_and_defaults_missing_kind_to_command() {
+        let agent = serde_json::from_str::<ClientMessage>(
+            r#"{"type":"desktop_notify","kind":"agent","tab_id":7,"title":"完成","body":"codex"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            agent,
+            ClientMessage::DesktopNotify {
+                kind: NotificationKind::Agent,
+                tab_id: Some(7),
+                ..
+            }
+        ));
+
+        let legacy = serde_json::from_str::<ClientMessage>(
+            r#"{"type":"desktop_notify","title":"完成","body":"make"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            ClientMessage::DesktopNotify {
+                kind: NotificationKind::Command,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_save_config_notification_setting_maps_to_agent_preference() {
+        let parsed = serde_json::from_str::<ClientMessage>(
+            r#"{"type":"save_config","config":{"theme":"lotus","shell":"","font":"JetBrains Mono","font_size":14,"opacity":1.0,"notifications_enabled":false}}"#,
+        )
+        .unwrap();
+
+        let ClientMessage::SaveConfig { config } = parsed else {
+            panic!("expected save_config message");
+        };
+        assert!(!config.agent_notifications_enabled);
+        assert!(!config.command_notifications_enabled);
     }
 }

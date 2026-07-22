@@ -32,6 +32,8 @@ pub enum TermEvent {
         cwd: String,
         code: i32,
     },
+    /// 常驻 Agent CLI 的单次任务开始/结束（OSC 9;4）。
+    AgentProgress { tab_id: u32, active: bool },
 }
 
 /// 一个 tab 的运行时状态
@@ -73,7 +75,7 @@ pub struct TermManager {
     /// shell 集成脚本路径（None 表示不启用）
     init_file: Option<std::path::PathBuf>,
     /// 给 reader 线程用的 sender（每个 tab spawn 时 clone 一份）
-    event_tx: mpsc::Sender<TermEvent>,
+    event_tx: mpsc::SyncSender<TermEvent>,
 }
 
 impl TermManager {
@@ -81,7 +83,7 @@ impl TermManager {
     pub fn new(
         shell: String,
         default_cwd: String,
-        event_tx: mpsc::Sender<TermEvent>,
+        event_tx: mpsc::SyncSender<TermEvent>,
         init_file: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
@@ -111,7 +113,7 @@ impl TermManager {
         let cwd = cwd_override.unwrap_or(&self.default_cwd);
 
         // 每个 tab 用自己的 PtyOutput channel 桥接到统一的 TermEvent channel
-        let (pty_tx, pty_rx) = mpsc::channel::<PtyOutput>();
+        let (pty_tx, pty_rx) = mpsc::sync_channel::<PtyOutput>(32);
         let handle = spawn_shell(
             &self.shell,
             cols,
@@ -156,6 +158,12 @@ impl TermManager {
                                 cwd: info.cwd,
                                 code: info.code,
                             },
+                            CommandEvent::AgentStart => {
+                                TermEvent::AgentProgress { tab_id, active: true }
+                            }
+                            CommandEvent::AgentEnd => {
+                                TermEvent::AgentProgress { tab_id, active: false }
+                            }
                         };
                         let _ = event_tx.send(ev);
                     }
@@ -262,6 +270,11 @@ impl TermManager {
     /// 判断某项目是否还有存活的 tab（切换项目时空项目判断用）
     pub fn has_tabs_for_project(&self, project_id: u32) -> bool {
         self.tabs.values().any(|t| t.project_id == project_id)
+    }
+
+    /// 判断 tab 是否仍由 Manager 持有（用于丢弃显式关闭后的迟到事件）。
+    pub fn has_tab(&self, tab_id: u32) -> bool {
+        self.tabs.contains_key(&tab_id)
     }
 
     /// 关闭所有 tab（退出/切换项目时调用）
@@ -435,4 +448,3 @@ mod tests {
         assert_eq!(results[1].code, 1);
     }
 }
-

@@ -166,6 +166,33 @@
           </div>
         </section>
 
+        <!-- ===== 通知分区 ===== -->
+        <section class="settings-section">
+          <h2 class="section-title">通知</h2>
+
+          <div class="settings-row">
+            <label class="row-label" for="setting-agent-notifications-enabled">Agent CLI 执行完毕</label>
+            <div class="row-control">
+              <label class="toggle-switch" for="setting-agent-notifications-enabled">
+                <input type="checkbox" id="setting-agent-notifications-enabled" checked />
+                <span class="toggle-track" aria-hidden="true"></span>
+              </label>
+              <span class="row-hint">Agent CLI 完成或失败时发送桌面通知</span>
+            </div>
+          </div>
+
+          <div class="settings-row">
+            <label class="row-label" for="setting-command-notifications-enabled">普通命令执行完毕</label>
+            <div class="row-control">
+              <label class="toggle-switch" for="setting-command-notifications-enabled">
+                <input type="checkbox" id="setting-command-notifications-enabled" />
+                <span class="toggle-track" aria-hidden="true"></span>
+              </label>
+              <span class="row-hint">普通命令完成或失败时发送桌面通知</span>
+            </div>
+          </div>
+        </section>
+
       </div>
 
       <!-- 底部按钮栏 -->
@@ -256,6 +283,8 @@
   <!-- 自定义右键菜单（OTTY 风格） -->
   <div id="ctx-menu" class="ctx-menu hidden" role="menu"></div>
 
+  <script src="notification-settings.js"></script>
+  <script src="terminal-output.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

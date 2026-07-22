@@ -25,6 +25,15 @@ pub struct Config {
     /// 窗口透明度 0.5~1.0（1.0 = 完全不透明）
     #[serde(default = "default_opacity")]
     pub opacity: f32,
+    /// Agent CLI 执行完毕时是否允许 Lotus 发送桌面通知
+    #[serde(
+        default = "default_agent_notifications_enabled",
+        alias = "notifications_enabled"
+    )]
+    pub agent_notifications_enabled: bool,
+    /// 普通命令执行完毕时是否允许 Lotus 发送桌面通知
+    #[serde(default)]
+    pub command_notifications_enabled: bool,
     /// 上次打开的项目 id（启动时自动恢复，None 表示用第一个项目）
     #[serde(default)]
     pub last_project_id: Option<u32>,
@@ -42,6 +51,9 @@ fn default_font_size() -> u16 {
 fn default_opacity() -> f32 {
     1.0
 }
+fn default_agent_notifications_enabled() -> bool {
+    true
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -51,6 +63,8 @@ impl Default for Config {
             font: default_font(),
             font_size: default_font_size(),
             opacity: default_opacity(),
+            agent_notifications_enabled: default_agent_notifications_enabled(),
+            command_notifications_enabled: false,
             last_project_id: None,
         }
     }
@@ -119,5 +133,39 @@ impl Config {
             }
         }
         "bash".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn old_config_enables_agent_notifications_and_disables_command_notifications() {
+        let cfg: Config = toml::from_str("theme = \"lotus\"").unwrap();
+
+        assert!(cfg.agent_notifications_enabled);
+        assert!(!cfg.command_notifications_enabled);
+    }
+
+    #[test]
+    fn legacy_disabled_global_notification_setting_disables_agent_notifications() {
+        let cfg: Config = toml::from_str("notifications_enabled = false").unwrap();
+
+        assert!(!cfg.agent_notifications_enabled);
+        assert!(!cfg.command_notifications_enabled);
+    }
+
+    #[test]
+    fn notification_preferences_round_trip_independently() {
+        let mut cfg = Config::default();
+        cfg.agent_notifications_enabled = false;
+        cfg.command_notifications_enabled = true;
+
+        let encoded = toml::to_string(&cfg).unwrap();
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+
+        assert!(!decoded.agent_notifications_enabled);
+        assert!(decoded.command_notifications_enabled);
     }
 }

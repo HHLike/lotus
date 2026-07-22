@@ -15,8 +15,8 @@ mod storage;
 mod term;
 mod theme;
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -32,12 +32,12 @@ use webkit2gtk::{
 use crate::config::Config;
 use crate::ipc::{
     AgentInfoPayload, BookmarkEntryPayload, ClientMessage, ConfigPayload, HistoryEntryPayload,
-    ProjectPayload, ServerMessage, ThemePayload,
+    NotificationKind, ProjectPayload, ServerMessage, ThemePayload,
 };
 use crate::storage::{
     now_ts, BookmarkStore, HistoryEntry, HistoryStore, ProjectStore, SessionStore, TabSession,
 };
-use crate::term::{TermEvent, TermManager};
+use crate::term::{OutputFlow, TermEvent, TermManager};
 use crate::theme::{rgb_to_css, Theme};
 
 /// 应用共享状态
@@ -48,6 +48,10 @@ struct AppState {
     event_rx: Option<std::sync::mpsc::Receiver<TermEvent>>,
     /// 给前端待发送的消息队列（批量缓冲）
     pending_outputs: Vec<ServerMessage>,
+    /// PTY 输出的分块、排序与浏览器 ACK 状态
+    output_flow: OutputFlow,
+    /// Lotus 为 Pi 注入 Agent 回合进度信号的扩展路径。
+    pi_notification_extension: Option<PathBuf>,
     /// 主题
     theme: Theme,
     /// 配置（设置面板读写）
@@ -68,6 +72,10 @@ struct AppState {
     /// tab 当前正在跑的命令（用于时长统计 / agent 通知）
     /// tab_id -> (cmd, started_at)
     running_cmds: HashMap<u32, (String, Instant)>,
+    /// 已收到 OSC 9;4 active、尚未收到 clear 的 Agent tab。
+    agent_active_tabs: HashSet<u32>,
+    /// 已发送过回合完成通知、等待抑制外层 CLI 退出通知的 tab。
+    agent_turn_notified_tabs: HashSet<u32>,
     /// 每项目当前激活的 tab_id（会话恢复 / 切换项目用）
     active_tab_by_project: HashMap<u32, u32>,
 }
@@ -195,6 +203,13 @@ fn main() -> Result<()> {
             None
         }
     };
+    let pi_notification_extension = match shell_integration::install_pi_notification_extension() {
+        Ok(path) => Some(path),
+        Err(e) => {
+            warn!("安装 Pi 通知扩展失败，将只支持 Agent 进程退出通知：{}", e);
+            None
+        }
+    };
 
     // 加载项目存储（首次启动自动创建默认项目 + 迁移旧数据）
     let projects = ProjectStore::load();
@@ -241,7 +256,7 @@ fn main() -> Result<()> {
     }
 
     // 创建 PTY 事件 channel + Manager（用当前项目的 cwd 作为默认目录）
-    let (event_tx, event_rx) = std::sync::mpsc::channel::<TermEvent>();
+    let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<TermEvent>(256);
     let manager = TermManager::new(shell, project_cwd.clone(), event_tx, init_file);
 
     // 应用状态（Arc<Mutex> 给 IPC 闭包用）
@@ -249,6 +264,8 @@ fn main() -> Result<()> {
         manager: Some(manager),
         event_rx: Some(event_rx),
         pending_outputs: Vec::new(),
+        output_flow: OutputFlow::default(),
+        pi_notification_extension,
         theme: theme.clone(),
         config: config.clone(),
         first_tab_created: false,
@@ -258,6 +275,8 @@ fn main() -> Result<()> {
         bookmarks,
         recents,
         running_cmds: HashMap::new(),
+        agent_active_tabs: HashSet::new(),
+        agent_turn_notified_tabs: HashSet::new(),
         active_tab_by_project: HashMap::new(),
     }));
 
@@ -491,25 +510,46 @@ fn main() -> Result<()> {
             // 非阻塞拉取所有 TermEvent（先收集，避免可变借用冲突）
             let mut command_starts: Vec<(u32, String, String)> = Vec::new();
             let mut command_runs: Vec<(u32, String, String, i32)> = Vec::new();
-            if let Some(rx) = s.event_rx.as_mut() {
-                while let Ok(event) = rx.try_recv() {
-                    match event {
+            let mut agent_progress: Vec<(u32, bool)> = Vec::new();
+            loop {
+                if s.output_flow.is_saturated() {
+                    break;
+                }
+                let event = {
+                    s.event_rx
+                        .as_mut()
+                        .and_then(|rx| rx.try_recv().ok())
+                };
+                match event {
+                    Some(event) => match event {
                         TermEvent::Output { tab_id, data } => {
-                            let b64 = ipc::encode_b64(&data);
-                            to_send.push(ServerMessage::Output { tab_id, data: b64 });
+                            if s.manager.as_ref().is_some_and(|m| m.has_tab(tab_id)) {
+                                s.output_flow.push(tab_id, data);
+                            }
                         }
                         TermEvent::Exited { tab_id } => {
-                            exited_tabs.push(tab_id);
-                            to_send.push(ServerMessage::TabClosed { tab_id });
+                            if s.manager.as_ref().is_some_and(|m| m.has_tab(tab_id)) {
+                                exited_tabs.push(tab_id);
+                            }
                         }
                         TermEvent::CommandStart { tab_id, cmd, cwd } => {
-                            command_starts.push((tab_id, cmd, cwd));
+                            if s.manager.as_ref().is_some_and(|m| m.has_tab(tab_id)) {
+                                command_starts.push((tab_id, cmd, cwd));
+                            }
                         }
                         TermEvent::CommandRun { tab_id, cmd, cwd, code } => {
                             // 先收集，循环外处理（避免和 rx 的借用冲突）
-                            command_runs.push((tab_id, cmd, cwd, code));
+                            if s.manager.as_ref().is_some_and(|m| m.has_tab(tab_id)) {
+                                command_runs.push((tab_id, cmd, cwd, code));
+                            }
                         }
-                    }
+                        TermEvent::AgentProgress { tab_id, active } => {
+                            if s.manager.as_ref().is_some_and(|m| m.has_tab(tab_id)) {
+                                agent_progress.push((tab_id, active));
+                            }
+                        }
+                    },
+                    None => break,
                 }
             }
             // 命令开始 → 记录时间 + 通知前端（tab 忙碌徽章）
@@ -577,9 +617,38 @@ fn main() -> Result<()> {
                     },
                 });
             }
+            for (tab_id, active) in agent_progress {
+                let transitioned = {
+                    let AppState {
+                        agent_active_tabs,
+                        agent_turn_notified_tabs,
+                        ..
+                    } = &mut *s;
+                    agent_progress_transition(
+                        agent_active_tabs,
+                        agent_turn_notified_tabs,
+                        tab_id,
+                        active,
+                    )
+                };
+                if transitioned && s.config.agent_notifications_enabled {
+                    let body = s
+                        .running_cmds
+                        .get(&tab_id)
+                        .map(|(cmd, _)| cmd.as_str())
+                        .unwrap_or("Agent CLI");
+                    desktop_notify("Agent 任务完成", body);
+                    s.agent_turn_notified_tabs.insert(tab_id);
+                }
+            }
             // 处理已退出的 tab（这时 rx 借用已结束）
             for tab_id in &exited_tabs {
                 s.running_cmds.remove(tab_id);
+                s.agent_active_tabs.remove(tab_id);
+                s.agent_turn_notified_tabs.remove(tab_id);
+                // Exited 在该 tab 的最后一个 Output 之后到达。先标记关闭，等所有
+                // 已排队输出被 xterm ACK 后再通知前端销毁终端，避免丢尾部控制序列。
+                s.output_flow.mark_closing(*tab_id);
                 // 清理 active 映射
                 s.active_tab_by_project.retain(|_, tid| *tid != *tab_id);
                 if let Some(m) = s.manager.as_mut() {
@@ -594,9 +663,23 @@ fn main() -> Result<()> {
             if !s.pending_outputs.is_empty() {
                 to_send.append(&mut s.pending_outputs);
             }
+            for chunk in s.output_flow.take_ready() {
+                to_send.push(ServerMessage::Output {
+                    tab_id: chunk.tab_id,
+                    seq: chunk.seq,
+                    data: ipc::encode_b64(&chunk.data),
+                });
+            }
+            for tab_id in s.output_flow.take_drained_closing() {
+                to_send.push(ServerMessage::TabClosed { tab_id });
+            }
         }
         // 下发给前端
         for msg in to_send {
+            let output_delivery = match &msg {
+                ServerMessage::Output { tab_id, seq, .. } => Some((*tab_id, *seq)),
+                _ => None,
+            };
             let json = msg.to_json();
             // 直接调用 window.__lotus.onMessage（__lotus 在 app.js 最早定义，带缓冲队列）
             // 把 JSON 对象字面量直接作为 JS 传入；onMessage 内部会处理
@@ -609,12 +692,17 @@ fn main() -> Result<()> {
             #[allow(deprecated)]
             {
                 let js_for_log = js.chars().take(120).collect::<String>();
+                let state_for_delivery = state_for_tick.clone();
                 webview_for_tick.run_javascript(
                     &js,
                     None::<&gtk::gio::Cancellable>,
                     move |result: Result<JavascriptResult, gtk::glib::Error>| {
                         if let Err(e) = result {
                             log::warn!("run_javascript 失败 [{}...]: {}", js_for_log, e);
+                            if let Some((tab_id, seq)) = output_delivery {
+                                let mut state = state_for_delivery.lock().unwrap();
+                                state.output_flow.retry(tab_id, seq);
+                            }
                         }
                     },
                 );
@@ -672,6 +760,9 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
             s.pending_outputs.push(ServerMessage::Theme {
                 theme: theme_payload,
             });
+            // 启动即同步完整配置，让通知开关无需先打开设置页也能生效。
+            let config_msg = config_message(&s.config);
+            s.pending_outputs.push(config_msg);
             if !s.first_tab_created {
                 s.first_tab_created = true;
                 // 恢复上次会话的全部 tab；若无会话则开 1 个默认 tab
@@ -728,6 +819,9 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
                 m.close_tab(tab_id);
             }
             s.running_cmds.remove(&tab_id);
+            s.agent_active_tabs.remove(&tab_id);
+            s.agent_turn_notified_tabs.remove(&tab_id);
+            s.output_flow.remove(tab_id);
             if let Some(pid) = proj {
                 if s.active_tab_by_project.get(&pid) == Some(&tab_id) {
                     // 选同项目剩余第一个
@@ -770,6 +864,9 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
                 }
             }
         }
+        ClientMessage::OutputAck { tab_id, seq } => {
+            s.output_flow.acknowledge(tab_id, seq);
+        }
         ClientMessage::WindowMinimize | ClientMessage::WindowToggleMaximize => unreachable!(),
         // ===== 设置相关 =====
         ClientMessage::Devtools => {
@@ -780,8 +877,8 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
         ClientMessage::GetConfig => {
             info!("前端请求配置");
             // 推送当前配置 + 主题列表 + 字体列表 + shell 列表
-            let cfg_payload = config_to_payload(&s.config);
-            s.pending_outputs.push(ServerMessage::Config { config: cfg_payload });
+            let config_msg = config_message(&s.config);
+            s.pending_outputs.push(config_msg);
             s.pending_outputs.push(ServerMessage::ThemesList {
                 names: Theme::list().iter().map(|s| s.to_string()).collect(),
             });
@@ -808,6 +905,8 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
             s.config.font = config.font.clone();
             s.config.font_size = config.font_size;
             s.config.opacity = config.opacity;
+            s.config.agent_notifications_enabled = config.agent_notifications_enabled;
+            s.config.command_notifications_enabled = config.command_notifications_enabled;
             // shell：空字符串当作 None（用默认）
             s.config.shell = if config.shell.is_empty() {
                 None
@@ -949,6 +1048,9 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
                         m.close_tab(tid);
                     }
                     s.running_cmds.remove(&tid);
+                    s.agent_active_tabs.remove(&tid);
+                    s.agent_turn_notified_tabs.remove(&tid);
+                    s.output_flow.remove(tid);
                     s.pending_outputs.push(ServerMessage::TabClosed { tab_id: tid });
                 }
                 s.active_tab_by_project.remove(&id);
@@ -1044,10 +1146,14 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
                     .unwrap_or("agent")
                     .to_string()
             });
+            let run_command = instrument_agent_command(
+                &command,
+                s.pi_notification_extension.as_deref(),
+            );
             if let Some(m) = s.manager.as_mut() {
                 match m.create_tab(80, 24, run_cwd.as_deref(), pid) {
                     Ok(tab_id) => {
-                        info!("启动 agent tab {} → {}", tab_id, command);
+                        info!("启动 agent tab {} → {}", tab_id, run_command);
                         m.set_title(tab_id, tab_title.clone());
                         m.set_command(tab_id, Some(command.clone()));
                         s.active_tab_by_project.insert(pid, tab_id);
@@ -1064,7 +1170,7 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
                         drop(s);
                         schedule_tab_commands(
                             state,
-                            vec![(tab_id, command, tab_title)],
+                            vec![(tab_id, run_command, tab_title)],
                         );
                         return;
                     }
@@ -1072,8 +1178,21 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
                 }
             }
         }
-        ClientMessage::DesktopNotify { title, body } => {
-            desktop_notify(&title, &body);
+        ClientMessage::DesktopNotify {
+            kind,
+            tab_id,
+            title,
+            body,
+        } => {
+            let enabled = notification_enabled(&s.config, kind);
+            if should_dispatch_client_notification(
+                enabled,
+                kind,
+                tab_id,
+                &mut s.agent_turn_notified_tabs,
+            ) {
+                desktop_notify(&title, &body);
+            }
         }
         ClientMessage::Quit => {
             info!("前端请求退出");
@@ -1304,7 +1423,11 @@ fn restore_sessions(s: &mut AppState) -> Vec<(u32, String, String)> {
             });
             if let Some(cmd) = sess.command {
                 if !cmd.trim().is_empty() {
-                    delayed.push((tab_id, cmd, title));
+                    let run_command = instrument_agent_command(
+                        &cmd,
+                        s.pi_notification_extension.as_deref(),
+                    );
+                    delayed.push((tab_id, run_command, title));
                 }
             }
         }
@@ -1535,6 +1658,85 @@ fn config_to_payload(config: &Config) -> ConfigPayload {
         font: config.font.clone(),
         font_size: config.font_size,
         opacity: config.opacity,
+        agent_notifications_enabled: config.agent_notifications_enabled,
+        command_notifications_enabled: config.command_notifications_enabled,
+    }
+}
+
+fn notification_enabled(config: &Config, kind: NotificationKind) -> bool {
+    match kind {
+        NotificationKind::Agent => config.agent_notifications_enabled,
+        NotificationKind::Command => config.command_notifications_enabled,
+    }
+}
+
+fn should_dispatch_client_notification(
+    enabled: bool,
+    kind: NotificationKind,
+    tab_id: Option<u32>,
+    agent_turn_notified_tabs: &mut HashSet<u32>,
+) -> bool {
+    if matches!(kind, NotificationKind::Agent)
+        && tab_id.is_some_and(|tab_id| agent_turn_notified_tabs.remove(&tab_id))
+    {
+        return false;
+    }
+    enabled
+}
+
+fn agent_progress_transition(
+    active_tabs: &mut HashSet<u32>,
+    notified_tabs: &mut HashSet<u32>,
+    tab_id: u32,
+    active: bool,
+) -> bool {
+    if active {
+        notified_tabs.remove(&tab_id);
+        active_tabs.insert(tab_id);
+        false
+    } else {
+        active_tabs.remove(&tab_id)
+    }
+}
+
+fn instrument_agent_command(command: &str, extension: Option<&Path>) -> String {
+    let Some(extension) = extension else {
+        return command.to_string();
+    };
+    let trimmed = command.trim();
+    let mut parts = trimmed.split_whitespace();
+    let Some(program) = parts.next() else {
+        return command.to_string();
+    };
+    if Path::new(program).file_name().and_then(|name| name.to_str()) != Some("pi") {
+        return command.to_string();
+    }
+
+    let remaining: Vec<&str> = parts.collect();
+    let non_interactive_subcommands = ["install", "remove", "uninstall", "update", "list", "config"];
+    if remaining
+        .first()
+        .is_some_and(|arg| non_interactive_subcommands.contains(arg))
+    {
+        return command.to_string();
+    }
+
+    let quoted_path = format!(
+        "'{}'",
+        extension.to_string_lossy().replace('\'', "'\\''")
+    );
+    if trimmed.contains(&format!("--extension {quoted_path}"))
+        || trimmed.contains(&format!("-e {quoted_path}"))
+    {
+        return command.to_string();
+    }
+    let suffix = &trimmed[program.len()..];
+    format!("{program} --extension {quoted_path}{suffix}")
+}
+
+fn config_message(config: &Config) -> ServerMessage {
+    ServerMessage::Config {
+        config: config_to_payload(config),
     }
 }
 
@@ -1610,7 +1812,13 @@ fn theme_to_payload(theme: &Theme) -> ThemePayload {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameHit, drag_threshold_exceeded, frame_hit, preferred_gdk_backend};
+    use super::{
+        FrameHit, agent_progress_transition, config_message, drag_threshold_exceeded, frame_hit,
+        instrument_agent_command, notification_enabled, preferred_gdk_backend,
+        should_dispatch_client_notification,
+    };
+    use crate::config::Config;
+    use crate::ipc::{NotificationKind, ServerMessage};
     use gtk::gdk::WindowEdge;
 
     #[test]
@@ -1694,5 +1902,97 @@ mod tests {
     fn drag_requires_pointer_motion_past_threshold() {
         assert!(!drag_threshold_exceeded(10.0, 10.0, 13.0, 12.0));
         assert!(drag_threshold_exceeded(10.0, 10.0, 14.0, 10.0));
+    }
+
+    #[test]
+    fn startup_config_message_carries_both_notification_preferences() {
+        let mut config = Config::default();
+        config.agent_notifications_enabled = false;
+        config.command_notifications_enabled = true;
+
+        let ServerMessage::Config { config } = config_message(&config) else {
+            panic!("expected config message");
+        };
+
+        assert!(!config.agent_notifications_enabled);
+        assert!(config.command_notifications_enabled);
+    }
+
+    #[test]
+    fn backend_notification_gate_uses_the_matching_preference() {
+        let mut config = Config::default();
+        assert!(notification_enabled(&config, NotificationKind::Agent));
+        assert!(!notification_enabled(&config, NotificationKind::Command));
+
+        config.agent_notifications_enabled = false;
+        config.command_notifications_enabled = true;
+        assert!(!notification_enabled(&config, NotificationKind::Agent));
+        assert!(notification_enabled(&config, NotificationKind::Command));
+    }
+
+    #[test]
+    fn agent_progress_notifies_once_for_each_active_to_idle_transition() {
+        let mut active_tabs = std::collections::HashSet::new();
+        let mut notified_tabs = std::collections::HashSet::new();
+
+        assert!(!agent_progress_transition(&mut active_tabs, &mut notified_tabs, 7, true));
+        assert!(!agent_progress_transition(&mut active_tabs, &mut notified_tabs, 7, true));
+        assert!(agent_progress_transition(&mut active_tabs, &mut notified_tabs, 7, false));
+        assert!(!agent_progress_transition(&mut active_tabs, &mut notified_tabs, 7, false));
+    }
+
+    #[test]
+    fn completed_agent_turn_suppresses_the_later_process_exit_notification_once() {
+        let mut completed_tabs = std::collections::HashSet::from([7]);
+
+        assert!(!should_dispatch_client_notification(
+            true,
+            NotificationKind::Agent,
+            Some(7),
+            &mut completed_tabs,
+        ));
+        assert!(should_dispatch_client_notification(
+            true,
+            NotificationKind::Agent,
+            Some(7),
+            &mut completed_tabs,
+        ));
+    }
+
+    #[test]
+    fn a_new_agent_turn_does_not_suppress_a_later_process_failure() {
+        let mut active_tabs = std::collections::HashSet::new();
+        let mut completed_tabs = std::collections::HashSet::from([7]);
+
+        agent_progress_transition(&mut active_tabs, &mut completed_tabs, 7, true);
+
+        assert!(should_dispatch_client_notification(
+            true,
+            NotificationKind::Agent,
+            Some(7),
+            &mut completed_tabs,
+        ));
+    }
+
+    #[test]
+    fn pi_launches_load_lotus_notification_extension_without_changing_other_commands() {
+        let extension = std::path::Path::new("/tmp/lotus pi.js");
+
+        assert_eq!(
+            instrument_agent_command("pi --resume", Some(extension)),
+            "pi --extension '/tmp/lotus pi.js' --resume"
+        );
+        assert_eq!(
+            instrument_agent_command("pi update", Some(extension)),
+            "pi update"
+        );
+        assert_eq!(
+            instrument_agent_command("pi --extension /tmp/custom.js", Some(extension)),
+            "pi --extension '/tmp/lotus pi.js' --extension /tmp/custom.js"
+        );
+        assert_eq!(
+            instrument_agent_command("codex", Some(extension)),
+            "codex"
+        );
     }
 }

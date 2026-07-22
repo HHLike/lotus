@@ -69,7 +69,7 @@ pub fn spawn_shell(
     shell_cmd: &str,
     cols: u16,
     rows: u16,
-    tx: mpsc::Sender<PtyOutput>,
+    tx: mpsc::SyncSender<PtyOutput>,
     init_file: Option<&std::path::Path>,
     cwd: &str,
 ) -> Result<PtyHandle> {
