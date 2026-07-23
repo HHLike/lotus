@@ -35,7 +35,7 @@ function checkDeps() {
 
 // ====== 全局状态 ======
 const terminals = new Map(); // tabId -> { term, fit, pane, title, projectId }
-let nextTabTitle = (id) => `lotus ${id}`;
+const DEFAULT_TAB_TITLE = 'lotus';
 
 // tab 运行时（agent / 忙碌状态 / 徽章）
 // tabId -> { busy, cmd, isAgent }
@@ -716,7 +716,7 @@ function createTerminal(tabId, cols, rows, projectId) {
       }, true);
     }
 
-    terminals.set(tabId, { term, fit, pane, title: nextTabTitle(tabId), projectId });
+    terminals.set(tabId, { term, fit, pane, title: DEFAULT_TAB_TITLE, projectId });
     return { term, fit, pane };
   } catch (e) {
     showErrorOverlay('createTerminal 失败: ' + e.message + '\n' + (e.stack || ''));
@@ -1020,7 +1020,7 @@ function addTabUI(tabId, title, projectId) {
   }
   tab.innerHTML = `
     <span class="tab-badge" title=""></span>
-    <span class="tab-title">${escapeHtml(title || nextTabTitle(tabId))}</span>
+    <span class="tab-title">${escapeHtml(title || DEFAULT_TAB_TITLE)}</span>
     <button class="tab-close" title="关闭">×</button>
   `;
   // 初始化 tab 运行时状态

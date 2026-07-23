@@ -789,7 +789,7 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
                 match m.create_tab(80, 24, None, pid) {
                     Ok(tab_id) => {
                         info!("新建 tab: {}", tab_id);
-                        let title = format!("lotus {}", tab_id);
+                        let title = "lotus".to_string();
                         m.set_title(tab_id, title.clone());
                         s.active_tab_by_project.insert(pid, tab_id);
                         s.pending_outputs.push(ServerMessage::TabCreated {
@@ -863,7 +863,7 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
             }
         }
         ClientMessage::OutputAck { tab_id, seq } => {
-            s.output_flow.acknowledge(tab_id, seq);
+            let _ = s.output_flow.acknowledge(tab_id, seq);
         }
         ClientMessage::WindowMinimize | ClientMessage::WindowToggleMaximize => unreachable!(),
         // ===== 设置相关 =====
@@ -1105,19 +1105,38 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
             clipboard_set_text(&text);
         }
         ClientMessage::PasteToTab { tab_id } => {
-            if let Some(text) = clipboard_get_text() {
+            // 异步读剪贴板：避免 wait_for_text() 的嵌套主循环。
+            // 当剪贴板里是图片时，阻塞式 wait_for_text 会卡死主线程并导致
+            // WebKitGTK 重入崩溃。request_text 立即返回，数据就绪后回调写入 PTY。
+            let state_clone = state.clone();
+            let clipboard = gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD);
+            clipboard.request_text(move |_cb, text| {
+                let text = match text {
+                    Some(t) if !t.is_empty() => t.to_string(),
+                    _ => {
+                        warn!("系统剪贴板为空或非文本（如图片），跳过粘贴");
+                        return;
+                    }
+                };
+                let mut s = state_clone.lock().unwrap();
                 if let Some(m) = s.manager.as_mut() {
                     if let Err(e) = m.write(tab_id, text.as_bytes()) {
                         error!("粘贴到 tab {} 失败: {}", tab_id, e);
                     }
                 }
-            } else {
-                warn!("系统剪贴板为空或不可读");
-            }
+            });
         }
         ClientMessage::ClipboardRead { request_id } => {
-            let text = clipboard_get_text().unwrap_or_default();
-            s.pending_outputs.push(ServerMessage::ClipboardText { request_id, text });
+            // 同样改用异步 request_text，回调里把结果推入 pending_outputs，
+            // 由 16ms tick 正常 flush 给前端。
+            let state_clone = state.clone();
+            let clipboard = gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD);
+            clipboard.request_text(move |_cb, text| {
+                let text = text.map(|s| s.to_string()).unwrap_or_default();
+                let mut s = state_clone.lock().unwrap();
+                s.pending_outputs
+                    .push(ServerMessage::ClipboardText { request_id, text });
+            });
         }
         ClientMessage::GetAgents => {
             s.pending_outputs.push(ServerMessage::AgentsList {
@@ -1196,15 +1215,6 @@ fn handle_client_message(body: &str, state: &Arc<Mutex<AppState>>, window: &gtk:
             gtk::main_quit();
         }
     }
-}
-
-/// 读取 GTK 系统剪贴板文本
-fn clipboard_get_text() -> Option<String> {
-    let clipboard = gtk::Clipboard::get(&gtk::gdk::SELECTION_CLIPBOARD);
-    clipboard
-        .wait_for_text()
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
 }
 
 /// 写入 GTK 系统剪贴板文本
